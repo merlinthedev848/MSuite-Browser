@@ -156,8 +156,7 @@ function sendTabState(ws) {
 // ---------- Screencast Control ----------
 async function startScreencast(client) {
     await client.send('Page.startScreencast', {
-        format: 'jpeg',
-        quality: 95,
+        format: 'png',
         maxWidth: 1920,
         maxHeight: 1080,
         everyNthFrame: 1

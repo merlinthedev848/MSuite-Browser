@@ -119,11 +119,11 @@ function connectWS(token) {
 
         if (event.data instanceof Blob) {
             isBinary = true;
-            // Explicitly force image/jpeg type so the browser's native decoder uses the fast path
-            blob = event.data.type === 'image/jpeg' ? event.data : new Blob([event.data], { type: 'image/jpeg' });
+            // Explicitly force image/png type so the browser's native decoder uses the fast path
+            blob = event.data.type === 'image/png' ? event.data : new Blob([event.data], { type: 'image/png' });
         } else if (event.data instanceof ArrayBuffer) {
             isBinary = true;
-            blob = new Blob([event.data], { type: 'image/jpeg' });
+            blob = new Blob([event.data], { type: 'image/png' });
         }
 
         if (isBinary && blob) {
