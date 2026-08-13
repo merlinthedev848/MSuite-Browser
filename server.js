@@ -352,10 +352,23 @@ wss.on('connection', async (ws) => {
             }
         });
 
+        // Set up clipboard reporting binding for this client's context
+        await ws.context.exposeBinding('__reportCopy', (source, text) => {
+            if (source.page.isClosed()) return;
+            ws.send(JSON.stringify({ type: 'clipboard', text }));
+        });
+
         await ws.context.addInitScript(() => {
             document.addEventListener('mouseover', (e) => {
                 try {
                     window.__reportCursor(window.getComputedStyle(e.target).cursor);
+                } catch (_) {}
+            }, { passive: true, capture: true });
+
+            document.addEventListener('copy', () => {
+                try {
+                    const selected = window.getSelection().toString();
+                    if (selected) window.__reportCopy(selected);
                 } catch (_) {}
             }, { passive: true, capture: true });
         });
@@ -481,6 +494,18 @@ wss.on('connection', async (ws) => {
 
                 case 'type':
                     p.keyboard.type(msg.text).catch(() => {});
+                    break;
+
+                case 'back':
+                    p.goBack().catch(() => {});
+                    break;
+
+                case 'forward':
+                    p.goForward().catch(() => {});
+                    break;
+
+                case 'reload':
+                    p.reload().catch(() => {});
                     break;
             }
         } catch (err) {

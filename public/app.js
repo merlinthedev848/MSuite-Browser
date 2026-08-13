@@ -17,6 +17,14 @@ const loadingOverlay   = document.getElementById('loading-overlay');
 const loadingText      = document.getElementById('loading-text');
 const tabsContainer    = document.getElementById('tabs-container');
 const newTabBtn        = document.getElementById('new-tab-btn');
+const backBtn          = document.getElementById('back-btn');
+const forwardBtn       = document.getElementById('forward-btn');
+const reloadBtn        = document.getElementById('reload-btn');
+const clipBtn          = document.getElementById('clip-btn');
+const clipModal        = document.getElementById('clip-modal');
+const clipCloseBtn     = document.getElementById('clip-close-btn');
+const clipText         = document.getElementById('clip-text');
+const clipPushBtn      = document.getElementById('clip-push-btn');
 
 // ---------- State ----------
 let ws = null;
@@ -171,6 +179,13 @@ function connectWS(token) {
 
             case 'cursor':
                 overlay.style.cursor = msg.cursor || 'default';
+                break;
+
+            case 'clipboard':
+                clipText.value = msg.text;
+                clipText.classList.remove('clip-glow-anim');
+                void clipText.offsetWidth; // Trigger reflow
+                clipText.classList.add('clip-glow-anim');
                 break;
         }
     };
@@ -369,3 +384,30 @@ urlInput.addEventListener('keydown', (e) => {
 });
 
 urlInput.addEventListener('focus', () => urlInput.select());
+
+// ---------- Navigation Buttons ----------
+backBtn.addEventListener('click', () => sendMsg({ type: 'back' }));
+forwardBtn.addEventListener('click', () => sendMsg({ type: 'forward' }));
+reloadBtn.addEventListener('click', () => sendMsg({ type: 'reload' }));
+
+// ---------- Clipboard Panel ----------
+clipBtn.addEventListener('click', () => {
+    clipModal.classList.toggle('hidden');
+    if (!clipModal.classList.contains('hidden')) {
+        clipText.focus();
+        clipText.select();
+    }
+});
+
+clipCloseBtn.addEventListener('click', () => {
+    clipModal.classList.add('hidden');
+});
+
+clipPushBtn.addEventListener('click', () => {
+    const text = clipText.value;
+    if (text) {
+        sendMsg({ type: 'type', text });
+        clipModal.classList.add('hidden');
+        viewportContainer.focus();
+    }
+});

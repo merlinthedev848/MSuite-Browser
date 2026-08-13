@@ -48,6 +48,24 @@
                 <span class="dot minimize"></span>
                 <span class="dot maximize"></span>
             </div>
+            <div class="nav-buttons">
+                <button id="back-btn" class="nav-btn" aria-label="Go Back" title="Back">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="15 18 9 12 15 6"></polyline>
+                    </svg>
+                </button>
+                <button id="forward-btn" class="nav-btn" aria-label="Go Forward" title="Forward">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="9 18 15 12 9 6"></polyline>
+                    </svg>
+                </button>
+                <button id="reload-btn" class="nav-btn" aria-label="Reload Page" title="Reload">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M23 4v6h-6"></path>
+                        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+                    </svg>
+                </button>
+            </div>
             <div class="address-bar">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lock-icon" aria-hidden="true">
                     <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
@@ -65,6 +83,12 @@
                 <span class="status-dot disconnected" aria-hidden="true"></span>
                 <span class="status-text">Disconnected</span>
             </div>
+            <button id="clip-btn" class="clip-btn" title="Clipboard Sync" aria-label="View synced clipboard">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
+                    <rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect>
+                </svg>
+            </button>
         </header>
 
         <!-- Tab Bar -->
@@ -92,6 +116,21 @@
                 <div id="interaction-overlay"></div>
             </div>
         </main>
+
+        <!-- Synced Clipboard Modal -->
+        <div id="clip-modal" class="clip-modal hidden" role="dialog" aria-labelledby="clip-modal-title">
+            <div class="clip-modal-header">
+                <h3 id="clip-modal-title">Clipboard Manager</h3>
+                <button id="clip-close-btn" aria-label="Close clipboard panel">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+            </div>
+            <p>Paste text below to push it to the remote browser's keyboard, or copy text retrieved from the remote session:</p>
+            <textarea id="clip-text" placeholder="Type or paste content here..." autocomplete="off" spellcheck="false"></textarea>
+            <div class="clip-modal-actions">
+                <button id="clip-push-btn">Send text to remote cursor</button>
+            </div>
+        </div>
     </div>
 
     <script src="app.js"></script>
