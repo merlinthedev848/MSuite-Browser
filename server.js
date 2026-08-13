@@ -116,10 +116,26 @@ let browserReady = false;
 /** Send a frame to one client with explicit flow control */
 function sendFrameToClient(ws, data) {
     if (ws.readyState !== WebSocket.OPEN) return;
+
+    if (ws.ackTimeout) {
+        clearTimeout(ws.ackTimeout);
+        ws.ackTimeout = null;
+    }
+
     if (!ws.frameInFlight) {
         ws.frameInFlight = true;
         const buffer = Buffer.from(data, 'base64');
         ws.send(buffer);
+
+        // 1.5s fail-safe timeout to prevent stream freezing from dropped client acks
+        ws.ackTimeout = setTimeout(() => {
+            ws.frameInFlight = false;
+            if (ws.lastFrameData) {
+                const nextData = ws.lastFrameData;
+                ws.lastFrameData = null;
+                sendFrameToClient(ws, nextData);
+            }
+        }, 1500);
     } else {
         ws.lastFrameData = data;
     }
@@ -141,7 +157,7 @@ function sendTabState(ws) {
 async function startScreencast(client) {
     await client.send('Page.startScreencast', {
         format: 'jpeg',
-        quality: 80,
+        quality: 95,
         maxWidth: 1920,
         maxHeight: 1080,
         everyNthFrame: 1
@@ -272,7 +288,9 @@ async function startBrowser() {
                 '--disable-gpu',
                 '--disable-accelerated-2d-canvas',
                 '--enable-font-antialiasing',
-                '--disable-lcd-text'
+                '--font-render-hinting=medium',
+                '--subpixel-text-rendering',
+                '--force-color-profile=srgb'
             ]
         });
 
@@ -359,6 +377,10 @@ wss.on('connection', async (ws) => {
 
         try {
             if (msg.type === 'frame_ack') {
+                if (ws.ackTimeout) {
+                    clearTimeout(ws.ackTimeout);
+                    ws.ackTimeout = null;
+                }
                 ws.frameInFlight = false;
                 if (ws.lastFrameData) {
                     const data = ws.lastFrameData;
@@ -468,6 +490,10 @@ wss.on('connection', async (ws) => {
 
     ws.on('close', async () => {
         console.log('[-] Client disconnected');
+        if (ws.ackTimeout) {
+            clearTimeout(ws.ackTimeout);
+            ws.ackTimeout = null;
+        }
         // Close browser context associated with this client to clear memory, history, cookies, and localstorage
         if (ws.context) {
             await ws.context.close().catch(() => {});

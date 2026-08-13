@@ -10,6 +10,14 @@ COPY package*.json ./
 # Install application dependencies
 RUN npm install
 
+# Install system fonts for high-quality rendering and emojis
+RUN apt-get update && apt-get install -y \
+    fonts-liberation \
+    fonts-dejavu \
+    fonts-noto-color-emoji \
+    fontconfig \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install Playwright browsers and their OS dependencies
 # Playwright provides a command to install all necessary system libraries for Chromium
 RUN npx playwright install chromium --with-deps

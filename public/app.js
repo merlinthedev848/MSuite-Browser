@@ -1,49 +1,35 @@
 // ---------- DOM References ----------
-const loginScreen   = document.getElementById('login-screen');
-const loginForm     = document.getElementById('login-form');
-const passwordInput = document.getElementById('password-input');
-const loginError    = document.getElementById('login-error');
-const loginBtn      = document.getElementById('login-btn');
-const appContainer  = document.getElementById('app-container');
-const canvas        = document.getElementById('screencast');
-const urlInput      = document.getElementById('url-input');
-const goBtn         = document.getElementById('go-btn');
-const statusDot     = document.querySelector('.status-dot');
-const statusText    = document.querySelector('.status-text');
-const loadingOverlay = document.getElementById('loading-overlay');
-const loadingText   = document.getElementById('loading-text');
-const tabsContainer = document.getElementById('tabs-container');
-const newTabBtn     = document.getElementById('new-tab-btn');
-
-// Canvas 2D context — alpha:false skips compositing, desynchronized reduces latency
-const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+const loginScreen      = document.getElementById('login-screen');
+const loginForm        = document.getElementById('login-form');
+const passwordInput    = document.getElementById('password-input');
+const loginError       = document.getElementById('login-error');
+const loginBtn         = document.getElementById('login-btn');
+const appContainer     = document.getElementById('app-container');
+const viewportContainer = document.getElementById('viewport-container');
+const imgA             = document.getElementById('screencast-a');
+const imgB             = document.getElementById('screencast-b');
+const overlay          = document.getElementById('interaction-overlay');
+const urlInput         = document.getElementById('url-input');
+const goBtn            = document.getElementById('go-btn');
+const statusDot        = document.querySelector('.status-dot');
+const statusText       = document.querySelector('.status-text');
+const loadingOverlay   = document.getElementById('loading-overlay');
+const loadingText      = document.getElementById('loading-text');
+const tabsContainer    = document.getElementById('tabs-container');
+const newTabBtn        = document.getElementById('new-tab-btn');
 
 // ---------- State ----------
 let ws = null;
 let appInitialized = false;
 let reconnectTimer = null;
 
+// Double buffer variables for flicker-free streaming
+let activeImg = imgA;
+let bufferImg = imgB;
+
 // Remote browser resolution — must match server.js viewport
 const REMOTE_W = 1920;
 const REMOTE_H = 1080;
-
-// ---------- Canvas Setup ----------
-function applyCanvasSettings() {
-    // Must be called after every resize — setting canvas.width/height resets ALL context state
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-}
-
-function resizeCanvas() {
-    const parent = canvas.parentElement;
-    const newW = parent.clientWidth;
-    const newH = parent.clientHeight;
-    if (canvas.width !== newW || canvas.height !== newH) {
-        canvas.width  = newW;
-        canvas.height = newH;
-        applyCanvasSettings(); // Restore after reset
-    }
-}
 
 // ---------- Session Persistence ----------
 const storedToken = sessionStorage.getItem('vb_token');
@@ -89,9 +75,6 @@ function initApp(token) {
     if (appInitialized) return;
     appInitialized = true;
 
-    window.addEventListener('resize', resizeCanvas);
-    resizeCanvas();
-
     connectWS(token);
 }
 
@@ -105,14 +88,14 @@ function connectWS(token) {
     ws.onopen = () => {
         statusDot.classList.replace('disconnected', 'connected');
         statusText.textContent = 'Connected';
-        canvas.focus();
+        viewportContainer.focus();
     };
 
     ws.onclose = () => {
         statusDot.classList.replace('connected', 'disconnected');
         statusText.textContent = 'Reconnecting...';
         showOverlay('Reconnecting...');
-        canvas.classList.remove('ready');
+        viewportContainer.classList.remove('ready');
 
         // Retry immediately with the same token — no login screen flash
         reconnectTimer = setTimeout(() => connectWS(token), 3000);
@@ -128,30 +111,47 @@ function connectWS(token) {
 
         if (event.data instanceof Blob) {
             isBinary = true;
-            blob = event.data;
+            // Explicitly force image/jpeg type so the browser's native decoder uses the fast path
+            blob = event.data.type === 'image/jpeg' ? event.data : new Blob([event.data], { type: 'image/jpeg' });
         } else if (event.data instanceof ArrayBuffer) {
             isBinary = true;
             blob = new Blob([event.data], { type: 'image/jpeg' });
         }
 
         if (isBinary && blob) {
-            if (typeof createImageBitmap === 'function') {
-                createImageBitmap(blob)
-                    .then(bitmap => {
-                        if (!canvas.classList.contains('ready')) {
-                            hideOverlay();
-                            canvas.classList.add('ready');
-                        }
-                        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-                        bitmap.close();
-                        sendMsg({ type: 'frame_ack' });
-                    })
-                    .catch(() => {
-                        renderWithObjectURL(blob);
-                    });
-            } else {
-                renderWithObjectURL(blob);
-            }
+            const url = URL.createObjectURL(blob);
+            
+            bufferImg.onload = () => {
+                // Swap active and buffer images
+                bufferImg.classList.add('active');
+                activeImg.classList.remove('active');
+
+                // Toggle references
+                const temp = activeImg;
+                activeImg = bufferImg;
+                bufferImg = temp;
+
+                // Revoke old URL of the new bufferImg (which was the old activeImg)
+                if (bufferImg.dataset.srcUrl) {
+                    URL.revokeObjectURL(bufferImg.dataset.srcUrl);
+                }
+                // Save current URL to revoke on the next frame swap
+                activeImg.dataset.srcUrl = url;
+
+                if (!viewportContainer.classList.contains('ready')) {
+                    hideOverlay();
+                    viewportContainer.classList.add('ready');
+                }
+
+                sendMsg({ type: 'frame_ack' });
+            };
+
+            bufferImg.onerror = () => {
+                URL.revokeObjectURL(url);
+                sendMsg({ type: 'frame_ack' });
+            };
+
+            bufferImg.src = url;
             return;
         }
 
@@ -170,28 +170,10 @@ function connectWS(token) {
                 break;
 
             case 'cursor':
-                canvas.style.cursor = msg.cursor || 'default';
+                overlay.style.cursor = msg.cursor || 'default';
                 break;
-    };
-}
-
-function renderWithObjectURL(blob) {
-    const url = URL.createObjectURL(blob);
-    const img = new Image();
-    img.onload = () => {
-        if (!canvas.classList.contains('ready')) {
-            hideOverlay();
-            canvas.classList.add('ready');
         }
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        URL.revokeObjectURL(url); // Immediately free memory
-        sendMsg({ type: 'frame_ack' });
     };
-    img.onerror = () => {
-        URL.revokeObjectURL(url);
-        sendMsg({ type: 'frame_ack' });
-    };
-    img.src = url;
 }
 
 // ---------- Overlay ----------
@@ -211,7 +193,6 @@ function sendMsg(msg) {
 }
 
 // ---------- Tabs ----------
-// Keep DOM nodes for tabs so we can diff-update instead of full rebuild
 const tabDomMap = new Map(); // tabId -> tabEl
 
 function renderTabs(tabs) {
@@ -246,7 +227,7 @@ function renderTabs(tabs) {
             tabEl.addEventListener('click', () => {
                 if (!tabEl.classList.contains('active')) {
                     showOverlay('Switching tabs...');
-                    canvas.classList.remove('ready');
+                    viewportContainer.classList.remove('ready');
                     sendMsg({ type: 'switch_tab', tabId: tab.id });
                 }
             });
@@ -287,7 +268,7 @@ function renderTabs(tabs) {
     // Ensure DOM order matches server order
     tabs.forEach(tab => {
         const el = tabDomMap.get(tab.id);
-        if (el) tabsContainer.appendChild(el); // appendChild moves if already in DOM
+        if (el) tabsContainer.appendChild(el);
     });
 }
 
@@ -295,7 +276,7 @@ newTabBtn.addEventListener('click', () => sendMsg({ type: 'new_tab' }));
 
 // ---------- Coordinate Mapping ----------
 function getMappedCoords(e) {
-    const rect = canvas.getBoundingClientRect();
+    const rect = overlay.getBoundingClientRect();
     return {
         x: Math.round((e.clientX - rect.left) * (REMOTE_W / rect.width)),
         y: Math.round((e.clientY - rect.top)  * (REMOTE_H / rect.height))
@@ -306,7 +287,7 @@ const mapButton = (e) => ['left', 'middle', 'right'][e.button] ?? 'left';
 
 // ---------- Mouse Events ----------
 let lastMoveTime = 0;
-canvas.addEventListener('mousemove', (e) => {
+overlay.addEventListener('mousemove', (e) => {
     const now = performance.now();
     if (now - lastMoveTime < 33) return; // Cap at ~30fps
     lastMoveTime = now;
@@ -314,20 +295,21 @@ canvas.addEventListener('mousemove', (e) => {
     sendMsg({ type: 'mousemove', x: c.x, y: c.y });
 });
 
-canvas.addEventListener('mousedown', (e) => {
+overlay.addEventListener('mousedown', (e) => {
     e.preventDefault();
-    canvas.focus();
+    viewportContainer.focus();
     const c = getMappedCoords(e);
     sendMsg({ type: 'mousedown', x: c.x, y: c.y, button: mapButton(e) });
 });
 
-canvas.addEventListener('mouseup', (e) => {
+overlay.addEventListener('mouseup', (e) => {
     const c = getMappedCoords(e);
     sendMsg({ type: 'mouseup', x: c.x, y: c.y, button: mapButton(e) });
 });
-canvas.addEventListener('contextmenu', e => e.preventDefault());
 
-canvas.addEventListener('wheel', (e) => {
+overlay.addEventListener('contextmenu', e => e.preventDefault());
+
+overlay.addEventListener('wheel', (e) => {
     e.preventDefault();
     sendMsg({ type: 'wheel', deltaX: e.deltaX, deltaY: e.deltaY });
 }, { passive: false });
@@ -351,7 +333,7 @@ const INTERCEPT_KEYS = new Set([
 
 window.addEventListener('keydown', (e) => {
     if (document.activeElement === urlInput || document.activeElement === passwordInput) return;
-    if (document.activeElement !== canvas) return;
+    if (document.activeElement !== viewportContainer) return;
 
     if (e.ctrlKey || e.metaKey || e.altKey || INTERCEPT_KEYS.has(e.key)) {
         e.preventDefault();
@@ -361,12 +343,12 @@ window.addEventListener('keydown', (e) => {
 
 window.addEventListener('keyup', (e) => {
     if (document.activeElement === urlInput || document.activeElement === passwordInput) return;
-    if (document.activeElement !== canvas) return;
+    if (document.activeElement !== viewportContainer) return;
     sendMsg({ type: 'keyup', key: e.key, modifiers: getModifiers(e) });
 });
 
 window.addEventListener('paste', (e) => {
-    if (document.activeElement !== canvas) return;
+    if (document.activeElement !== viewportContainer) return;
     const text = e.clipboardData?.getData('text');
     if (text) sendMsg({ type: 'type', text });
 });
@@ -376,14 +358,14 @@ function navigate() {
     const input = urlInput.value.trim();
     if (!input) return;
     sendMsg({ type: 'goto', url: input });
-    canvas.focus();
+    viewportContainer.focus();
 }
 
 goBtn.addEventListener('click', navigate);
 
 urlInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter')  { e.preventDefault(); navigate(); }
-    if (e.key === 'Escape') { canvas.focus(); }
+    if (e.key === 'Escape') { viewportContainer.focus(); }
 });
 
 urlInput.addEventListener('focus', () => urlInput.select());

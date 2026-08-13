@@ -86,7 +86,11 @@
                 <div class="spinner" aria-hidden="true"></div>
                 <p id="loading-text">Initializing Stream...</p>
             </div>
-            <canvas id="screencast" tabindex="0" aria-label="Remote browser display"></canvas>
+            <div id="viewport-container" tabindex="0" aria-label="Remote browser display">
+                <img id="screencast-a" class="screencast-viewport" alt="Viewport A" />
+                <img id="screencast-b" class="screencast-viewport" alt="Viewport B" />
+                <div id="interaction-overlay"></div>
+            </div>
         </main>
     </div>
 
