@@ -339,7 +339,10 @@ wss.on('connection', async (ws) => {
     try {
         ws.context = await browser.newContext({
             viewport: { width: 1920, height: 1080 },
-            deviceScaleFactor: 1
+            deviceScaleFactor: 1,
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+            locale: 'en-US',
+            timezoneId: 'Europe/London'
         });
 
         // Set up cursor reporting binding for this client's context
@@ -358,6 +361,9 @@ wss.on('connection', async (ws) => {
         });
 
         await ws.context.addInitScript(() => {
+            // Anti-detection: Hide webdriver parameter
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
             document.addEventListener('mouseover', (e) => {
                 try {
                     window.__reportCursor(window.getComputedStyle(e.target).cursor);
