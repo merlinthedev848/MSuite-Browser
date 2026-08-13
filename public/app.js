@@ -99,7 +99,12 @@ function connectWS(token) {
         viewportContainer.focus();
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+        // If the socket was closed due to auth failure, do not reconnect
+        if (event.code === 4001 || !sessionStorage.getItem('vb_token')) {
+            return;
+        }
+
         statusDot.classList.replace('connected', 'disconnected');
         statusText.textContent = 'Reconnecting...';
         showOverlay('Reconnecting...');
@@ -186,6 +191,15 @@ function connectWS(token) {
                 clipText.classList.remove('clip-glow-anim');
                 void clipText.offsetWidth; // Trigger reflow
                 clipText.classList.add('clip-glow-anim');
+                break;
+
+            case 'auth_error':
+                sessionStorage.removeItem('vb_token');
+                loginScreen.classList.remove('hidden');
+                appContainer.classList.add('hidden');
+                loginError.textContent = msg.error || 'Session expired';
+                loginError.classList.remove('hidden');
+                ws.close();
                 break;
         }
     };

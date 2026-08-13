@@ -96,13 +96,10 @@ const wss = new WebSocket.Server({ noServer: true });
 server.on('upgrade', (request, socket, head) => {
     const parsedUrl = url.parse(request.url, true);
     const token = parsedUrl.query.token;
+    const isValid = token && validTokens.has(token);
 
-    if (!token || !validTokens.has(token)) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-        return;
-    }
     wss.handleUpgrade(request, socket, head, (ws) => {
+        ws.isAuthorized = isValid;
         wss.emit('connection', ws, request);
     });
 });
@@ -309,6 +306,11 @@ startBrowser().catch(err => {
 
 // ---------- WebSocket Connection Handler ----------
 wss.on('connection', async (ws) => {
+    if (!ws.isAuthorized) {
+        ws.send(JSON.stringify({ type: 'auth_error', error: 'Session expired. Please log in again.' }));
+        ws.close(4001, 'Unauthorized');
+        return;
+    }
     console.log('[+] Client connected');
 
     // Setup connection-scoped state
