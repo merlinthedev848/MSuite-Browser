@@ -420,43 +420,75 @@ async function startBrowser() {
     browserStarting = true;
 
     try {
-        console.log('[*] Loading adblocker engine...');
+        console.log('[*] Launching Google Chrome + loading adblocker in parallel...');
+
+        // Launch Chrome and load adblocker simultaneously
         const cacheDir = path.join(__dirname, 'adblocker_cache');
         fs.mkdirSync(cacheDir, { recursive: true });
         const cachePath = path.join(cacheDir, 'adblocker.bin');
 
-        adblocker = await PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch, {
-            path: cachePath,
-            read: async (p) => fs.promises.readFile(p),
-            write: async (p, content) => fs.promises.writeFile(p, content)
-        }).catch(e => {
-            console.warn('[!] Adblocker failed to load:', e.message);
-            return null;
-        });
+        const [launchedBrowser, loadedAdblocker] = await Promise.all([
+            chromium.launch({
+                headless: true,
+                channel: 'chrome',
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--disable-accelerated-2d-canvas',
+                    '--enable-font-antialiasing',
+                    '--font-render-hinting=medium',
+                    '--subpixel-text-rendering',
+                    '--force-color-profile=srgb'
+                ]
+            }),
+            PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch, {
+                path: cachePath,
+                read: async (p) => fs.promises.readFile(p),
+                write: async (p, content) => fs.promises.writeFile(p, content)
+            }).catch(e => {
+                console.warn('[!] Adblocker failed to load:', e.message);
+                return null;
+            })
+        ]);
 
-        console.log('[*] Launching Google Chrome...');
-        browser = await chromium.launch({
-            headless: true,
-            channel: 'chrome',
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-accelerated-2d-canvas',
-                '--enable-font-antialiasing',
-                '--font-render-hinting=medium',
-                '--subpixel-text-rendering',
-                '--force-color-profile=srgb'
-            ]
-        });
+        browser = launchedBrowser;
+        adblocker = loadedAdblocker;
 
         browserReady = true;
         browserStarting = false;
         console.log('[*] Browser ready.');
+
+        // Pre-warm one context immediately so the first connection is instant
+        prewarmContextPool().catch(e => console.warn('[!] Prewarm failed:', e.message));
     } catch (err) {
         browserStarting = false;
         throw err;
+    }
+}
+
+// Pre-warmed context pool — keeps one idle context ready to hand off on connection
+let contextPool = null; // { context, page } | null
+
+async function prewarmContextPool() {
+    if (contextPool || !browserReady) return;
+    try {
+        const ctx = await browser.newContext({
+            viewport: { width: 1920, height: 1080 },
+            deviceScaleFactor: 1,
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+            locale: 'en-US',
+            timezoneId: 'Europe/London',
+            acceptDownloads: true
+        });
+        // Open a blank page so Chromium has a renderer process ready
+        const page = await ctx.newPage();
+        contextPool = { context: ctx, page };
+        console.log('[pool] Pre-warmed context ready.');
+    } catch (e) {
+        console.warn('[pool] Pre-warm failed:', e.message);
+        contextPool = null;
     }
 }
 
@@ -466,6 +498,7 @@ startBrowser().catch(err => {
 });
 
 async function initBrowserContext(ws) {
+    // Tear down any existing context for this session
     if (ws.context) {
         for (const tabId of ws.tabs.keys()) {
             ws.tabs.delete(tabId);
@@ -473,28 +506,42 @@ async function initBrowserContext(ws) {
         ws.activeTabId = null;
         ws.tabCounter = 0;
         await ws.context.close().catch(() => {});
+        ws.context = null;
     }
 
-    const contextOptions = {
-        viewport: { width: 1920, height: 1080 },
-        deviceScaleFactor: 1,
-        userAgent: ws.currentUserAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-        locale: 'en-US',
-        timezoneId: 'Europe/London',
-        acceptDownloads: true
-    };
+    const needsProxy = ws.vpnEnabled || !!ws.proxyServer;
 
-    if (ws.vpnEnabled) {
-        contextOptions.proxy = {
-            server: 'socks5://127.0.0.1:9050'
+    // Claim the pre-warmed pooled context if available and no proxy is needed
+    if (!needsProxy && contextPool) {
+        console.log('[pool] Handing off pre-warmed context to new session (instant).');
+        ws.context = contextPool.context;
+        // Close the placeholder blank page — createTab will open a real one
+        contextPool.page.close().catch(() => {});
+        contextPool = null;
+        // Immediately start warming the next context for the next connection
+        prewarmContextPool().catch(e => console.warn('[pool] Re-warm failed:', e.message));
+    } else {
+        // Create a fresh context (proxy scenario or pool was empty)
+        const contextOptions = {
+            viewport: { width: 1920, height: 1080 },
+            deviceScaleFactor: 1,
+            userAgent: ws.currentUserAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+            locale: 'en-US',
+            timezoneId: 'Europe/London',
+            acceptDownloads: true
         };
-        console.log('[vpn] Proxying browser context via socks5://127.0.0.1:9050 (Tor)');
-    } else if (ws.proxyServer) {
-        contextOptions.proxy = { server: ws.proxyServer };
-        console.log(`[proxy] Proxying browser context via: ${ws.proxyServer}`);
-    }
 
-    ws.context = await browser.newContext(contextOptions);
+        if (ws.vpnEnabled) {
+            // Cloudflare WARP SOCKS5 proxy — free, fast, userspace, no NET_ADMIN needed
+            contextOptions.proxy = { server: 'socks5://127.0.0.1:40000' };
+            console.log('[vpn] Routing context via Cloudflare WARP socks5://127.0.0.1:40000');
+        } else if (ws.proxyServer) {
+            contextOptions.proxy = { server: ws.proxyServer };
+            console.log(`[proxy] Proxying browser context via: ${ws.proxyServer}`);
+        }
+
+        ws.context = await browser.newContext(contextOptions);
+    }
 
     await ws.context.exposeBinding('__reportCursor', (source, cursor) => {
         if (source.page.isClosed()) return;
@@ -724,7 +771,7 @@ wss.on('connection', async (ws) => {
 
             if (msg.type === 'toggle_vpn') {
                 ws.vpnEnabled = msg.enabled;
-                console.log(`[vpn] VPN toggle: ${msg.enabled}`);
+                console.log(`[vpn] WARP VPN toggle: ${msg.enabled}`);
                 try {
                     await initBrowserContext(ws);
                     const tabId = await createTab(ws);

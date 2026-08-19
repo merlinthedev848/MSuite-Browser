@@ -199,13 +199,21 @@
                     </label>
                 </div>
                 <div class="settings-group proxy-group">
-                    <label for="proxy-input">🌐 Proxy Server <span class="label-hint">(socks5:// or http://)</span></label>
+                    <label for="proxy-input">🌐 Custom Proxy <span class="label-hint">(socks5:// or http://)</span></label>
                     <div class="proxy-row">
                         <input type="text" id="proxy-input" placeholder="socks5://user:pass@host:port" autocomplete="off" spellcheck="false" />
                         <button id="proxy-apply-btn" class="btn-small">Apply</button>
                         <button id="proxy-clear-btn" class="btn-small btn-outline">Off</button>
                     </div>
-                    <p class="settings-hint">🔒 Routes ALL browser traffic through your own secure proxy. Supports SOCKS5, SOCKS4, HTTP.</p>
+                    <p class="settings-hint">🔒 Routes ALL browser traffic through your own proxy. Supports SOCKS5, SOCKS4, HTTP.</p>
+                </div>
+                <div class="settings-group">
+                    <label class="toggle-control">
+                        <span>⚡ Free VPN <span class="label-hint">(Cloudflare WARP)</span></span>
+                        <input type="checkbox" id="vpn-toggle" />
+                        <span class="control-indicator"></span>
+                    </label>
+                    <p class="settings-hint">Routes traffic through Cloudflare's global network. Fast, free, no account needed. Hides your IP from websites.</p>
                 </div>
 
                 <p class="settings-section-label">User-Agent & Display</p>

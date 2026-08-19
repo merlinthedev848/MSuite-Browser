@@ -1,32 +1,34 @@
-# Use the official Node.js image based on Debian 12 (Bookworm - which is currently the most stable standard. Debian 13 "Trixie" is currently testing, but Bookworm packages are extremely compatible, or we can specify node:20-bookworm)
 FROM node:20-bookworm
 
-# Set working directory
 WORKDIR /usr/src/app
 
-# Copy package files
 COPY package*.json ./
-
-# Install application dependencies
 RUN npm install
 
-# Install system fonts and Tor onion routing proxy
+# ---- System fonts ----
 RUN apt-get update && apt-get install -y \
     fonts-liberation \
     fonts-dejavu \
     fonts-noto-color-emoji \
     fontconfig \
-    tor \
+    curl \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Playwright official Google Chrome with system dependencies
+# ---- Cloudflare WARP (free built-in VPN, SOCKS5 proxy mode — no NET_ADMIN needed) ----
+RUN curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+    | gpg --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ bookworm main" \
+    > /etc/apt/sources.list.d/cloudflare-client.list \
+    && apt-get update && apt-get install -y cloudflare-warp \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- Playwright Google Chrome (proprietary codecs for NVR/H.264) ----
 RUN npx playwright install chrome --with-deps
 
-# Copy application source code
 COPY . .
 
-# Expose the port the app runs on
 EXPOSE 3000
 
-# Start the Tor service in the background and launch the app
-CMD [ "sh", "-c", "tor & node server.js" ]
+# entrypoint.sh bootstraps WARP in SOCKS5 proxy mode then starts the app
+CMD [ "sh", "/usr/src/app/entrypoint.sh" ]

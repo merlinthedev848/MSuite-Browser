@@ -30,6 +30,7 @@ const settingsBtn       = document.getElementById('settings-btn');
 const settingsModal     = document.getElementById('settings-modal');
 const settingsCloseBtn  = document.getElementById('settings-close-btn');
 const adblockToggle     = document.getElementById('adblock-toggle');
+const vpnToggle         = document.getElementById('vpn-toggle');
 const uaSelect          = document.getElementById('ua-select');
 const customUaInput     = document.getElementById('custom-ua-input');
 const clearSessionBtn   = document.getElementById('clear-session-btn');
@@ -595,6 +596,16 @@ settingsCloseBtn.addEventListener('click', () => {
 
 adblockToggle.addEventListener('change', () => {
     sendMsg({ type: 'toggle_adblocker', enabled: adblockToggle.checked });
+});
+
+// ---------- Free VPN (Cloudflare WARP) ----------
+vpnToggle.addEventListener('change', () => {
+    const enabled = vpnToggle.checked;
+    sendMsg({ type: 'toggle_vpn', enabled });
+    showOverlay(enabled
+        ? '⚡ Connecting to Cloudflare WARP VPN...'
+        : '🔓 Disconnecting from WARP VPN...');
+    settingsModal.classList.add('hidden');
 });
 
 // ---------- Proxy Settings ----------
