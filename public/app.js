@@ -30,6 +30,7 @@ const settingsBtn       = document.getElementById('settings-btn');
 const settingsModal     = document.getElementById('settings-modal');
 const settingsCloseBtn  = document.getElementById('settings-close-btn');
 const adblockToggle     = document.getElementById('adblock-toggle');
+const vpnToggle         = document.getElementById('vpn-toggle');
 const uaSelect          = document.getElementById('ua-select');
 const customUaInput     = document.getElementById('custom-ua-input');
 const clearSessionBtn   = document.getElementById('clear-session-btn');
@@ -547,6 +548,12 @@ settingsCloseBtn.addEventListener('click', () => {
 
 adblockToggle.addEventListener('change', () => {
     sendMsg({ type: 'toggle_adblocker', enabled: adblockToggle.checked });
+});
+
+vpnToggle.addEventListener('change', () => {
+    sendMsg({ type: 'toggle_vpn', enabled: vpnToggle.checked });
+    showOverlay('Re-routing context through Tor...');
+    settingsModal.classList.add('hidden');
 });
 
 uaSelect.addEventListener('change', () => {

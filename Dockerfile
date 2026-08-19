@@ -10,12 +10,13 @@ COPY package*.json ./
 # Install application dependencies
 RUN npm install
 
-# Install system fonts for high-quality rendering and emojis
+# Install system fonts and Tor onion routing proxy
 RUN apt-get update && apt-get install -y \
     fonts-liberation \
     fonts-dejavu \
     fonts-noto-color-emoji \
     fontconfig \
+    tor \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Playwright browsers and their OS dependencies
@@ -28,5 +29,5 @@ COPY . .
 # Expose the port the app runs on
 EXPOSE 3000
 
-# Start the application
-CMD [ "node", "server.js" ]
+# Start the Tor service in the background and launch the app
+CMD [ "sh", "-c", "tor & node server.js" ]

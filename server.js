@@ -426,6 +426,66 @@ startBrowser().catch(err => {
     console.error('[!] Pre-warm failed, will retry on first connection:', err.message);
 });
 
+async function initBrowserContext(ws) {
+    if (ws.context) {
+        for (const tabId of ws.tabs.keys()) {
+            ws.tabs.delete(tabId);
+        }
+        ws.activeTabId = null;
+        ws.tabCounter = 0;
+        await ws.context.close().catch(() => {});
+    }
+
+    const contextOptions = {
+        viewport: { width: 1920, height: 1080 },
+        deviceScaleFactor: 1,
+        userAgent: ws.currentUserAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        locale: 'en-US',
+        timezoneId: 'Europe/London'
+    };
+
+    if (ws.vpnEnabled) {
+        contextOptions.proxy = {
+            server: 'socks5://127.0.0.1:9050'
+        };
+        console.log('[vpn] Proxying browser context via socks5://127.0.0.1:9050 (Tor)');
+    }
+
+    ws.context = await browser.newContext(contextOptions);
+
+    await ws.context.exposeBinding('__reportCursor', (source, cursor) => {
+        if (source.page.isClosed()) return;
+        const tab = Array.from(ws.tabs.values()).find(t => t.page === source.page);
+        if (tab && ws.activeTabId && ws.tabs.get(ws.activeTabId) === tab) {
+            ws.send(JSON.stringify({ type: 'cursor', cursor }));
+        }
+    });
+
+    await ws.context.exposeBinding('__reportCopy', (source, text) => {
+        if (source.page.isClosed()) return;
+        ws.send(JSON.stringify({ type: 'clipboard', text }));
+    });
+
+    const targetUA = ws.currentUserAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+    await ws.context.addInitScript((ua) => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.__customUA = ua;
+
+        document.addEventListener('mouseover', (e) => {
+            try {
+                window.__reportCursor(window.getComputedStyle(e.target).cursor);
+            } catch (_) {}
+        }, { passive: true, capture: true });
+
+        document.addEventListener('copy', () => {
+            try {
+                const selected = window.getSelection().toString();
+                if (selected) window.__reportCopy(selected);
+            } catch (_) {}
+        }, { passive: true, capture: true });
+    }, targetUA);
+}
+
 // ---------- WebSocket Connection Handler ----------
 wss.on('connection', async (ws) => {
     if (!ws.isAuthorized) {
@@ -445,6 +505,7 @@ wss.on('connection', async (ws) => {
     ws.currentUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
     ws.streamFormat = 'jpeg';
     ws.streamQuality = 90;
+    ws.vpnEnabled = false;
 
     let waited = 0;
     while (browserStarting && waited < 60_000) {
@@ -465,46 +526,7 @@ wss.on('connection', async (ws) => {
 
     // Create client-isolated BrowserContext
     try {
-        ws.context = await browser.newContext({
-            viewport: { width: 1920, height: 1080 },
-            deviceScaleFactor: 1,
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-            locale: 'en-US',
-            timezoneId: 'Europe/London'
-        });
-
-        // Set up cursor reporting binding for this client's context
-        await ws.context.exposeBinding('__reportCursor', (source, cursor) => {
-            if (source.page.isClosed()) return;
-            const tab = Array.from(ws.tabs.values()).find(t => t.page === source.page);
-            if (tab && ws.activeTabId && ws.tabs.get(ws.activeTabId) === tab) {
-                ws.send(JSON.stringify({ type: 'cursor', cursor }));
-            }
-        });
-
-        // Set up clipboard reporting binding for this client's context
-        await ws.context.exposeBinding('__reportCopy', (source, text) => {
-            if (source.page.isClosed()) return;
-            ws.send(JSON.stringify({ type: 'clipboard', text }));
-        });
-
-        await ws.context.addInitScript(() => {
-            // Anti-detection: Hide webdriver parameter
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-            document.addEventListener('mouseover', (e) => {
-                try {
-                    window.__reportCursor(window.getComputedStyle(e.target).cursor);
-                } catch (_) {}
-            }, { passive: true, capture: true });
-
-            document.addEventListener('copy', () => {
-                try {
-                    const selected = window.getSelection().toString();
-                    if (selected) window.__reportCopy(selected);
-                } catch (_) {}
-            }, { passive: true, capture: true });
-        });
+        await initBrowserContext(ws);
     } catch (err) {
         console.error('[!] Failed to create browser context:', err.message);
         ws.close(1011, 'Failed to initialize session');
@@ -552,6 +574,8 @@ wss.on('connection', async (ws) => {
             } else if (msg.type === 'set_stream_quality') {
                 if (typeof msg.format !== 'string' || !['png', 'jpeg'].includes(msg.format)) return;
                 if (msg.quality !== undefined && typeof msg.quality !== 'number') return;
+            } else if (msg.type === 'toggle_vpn') {
+                if (typeof msg.enabled !== 'boolean') return;
             }
         } catch {
             return;
@@ -639,6 +663,21 @@ wss.on('connection', async (ws) => {
                     await startScreencast(t.client, ws);
                 }
                 console.log(`[session] Stream quality updated to: ${msg.format} (quality: ${msg.quality || 'N/A'})`);
+                return;
+            }
+
+            if (msg.type === 'toggle_vpn') {
+                ws.vpnEnabled = msg.enabled;
+                console.log(`[vpn] VPN toggle: ${msg.enabled}`);
+                try {
+                    await initBrowserContext(ws);
+                    const tabId = await createTab(ws);
+                    await switchTab(ws, tabId);
+                    const p = ws.tabs.get(tabId).page;
+                    p.goto('https://www.google.com').catch(e => console.warn(`[nav] ${e.message}`));
+                } catch (err) {
+                    console.error('[!] Failed to toggle VPN context:', err.message);
+                }
                 return;
             }
 
