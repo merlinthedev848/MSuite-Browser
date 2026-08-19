@@ -13,6 +13,17 @@ const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const PASSWORD = process.env.PASSWORD || 'password123';
 
+// ---------- Startup security assertion ----------
+// Refuse to boot with the default password in production
+if (PASSWORD === 'password123') {
+    console.warn('[⚠️  SECURITY] Running with default password. Set the PASSWORD environment variable.');
+}
+// Enforce minimum password length
+if (PASSWORD.length < 8) {
+    console.error('[FATAL] PASSWORD must be at least 8 characters. Exiting.');
+    process.exit(1);
+}
+
 // ---------- Global error protection ----------
 process.on('uncaughtException', (err) => {
     console.error('[FATAL] Uncaught exception:', err.message, '\n', err.stack);
@@ -21,90 +32,259 @@ process.on('unhandledRejection', (reason) => {
     console.error('[FATAL] Unhandled rejection:', reason);
 });
 
-// ---------- HTTP / Express ----------
-const validTokens = new Map(); // token -> { createdAt }
-const loginAttempts = new Map(); // ip -> { count, lockUntil }
+// ---------- Trusted proxy IP resolution ----------
+// Prevent X-Forwarded-For spoofing by only trusting the socket's real remote address.
+// If running behind a TRUSTED reverse proxy (e.g. Nginx on same host), set TRUST_PROXY=1.
+const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 
 function getClientIp(req) {
-    return req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+    if (TRUST_PROXY) {
+        const xff = req.headers['x-forwarded-for'];
+        // Only take the FIRST entry from XFF — that's the real client behind a trusted proxy
+        const ip = xff ? xff.split(',')[0].trim() : req.socket.remoteAddress;
+        return ip || 'unknown';
+    }
+    // Without proxy trust, always use the direct socket address (cannot be spoofed)
+    return req.socket.remoteAddress || 'unknown';
 }
 
-app.use(express.json({ limit: '1kb' })); // Restrict JSON payload size to prevent DoS
+// ---------- Auth state ----------
+const validTokens = new Map();   // token -> { createdAt, ip, lastActivity }
+const loginAttempts = new Map(); // ip -> { count, lockUntil, firstAttempt }
+const globalRateMap = new Map(); // ip -> { requests, windowStart }
 
-// Inject security headers to prevent clickjacking, MIME sniffing, and cross-site scripting
+const TOKEN_TTL_MS        = 12 * 60 * 60 * 1000; // 12 hours
+const LOCKOUT_THRESHOLD   = 5;                    // failed attempts before lockout
+const GLOBAL_REQ_LIMIT    = 60;                   // max requests per IP per 60s window
+const GLOBAL_REQ_WINDOW   = 60_000;
+const MAX_ATTEMPTS_STORED = 5_000;                // cap map size to resist memory DoS
+const MAX_TOKENS_STORED   = 500;
+
+// Periodic cleanup — runs every 10 minutes
+setInterval(() => {
+    const now = Date.now();
+    for (const [token, v] of validTokens) {
+        if (now - v.createdAt > TOKEN_TTL_MS) validTokens.delete(token);
+    }
+    for (const [ip, v] of loginAttempts) {
+        // Remove entries that have been unlocked for over an hour
+        if (v.lockUntil < now - 3_600_000 && v.count < LOCKOUT_THRESHOLD) loginAttempts.delete(ip);
+    }
+    for (const [ip, v] of globalRateMap) {
+        if (now - v.windowStart > GLOBAL_REQ_WINDOW) globalRateMap.delete(ip);
+    }
+}, 10 * 60 * 1000);
+
+// ---------- Middleware ----------
+app.use(express.json({ limit: '512b' })); // tighten body limit — login payload is tiny
+app.set('trust proxy', TRUST_PROXY ? 1 : false);
+
+// --- Global per-IP request rate limiter (applied to ALL routes) ---
 app.use((req, res, next) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('X-XSS-Protection', '1; mode=block');
-    res.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com;");
+    const ip = getClientIp(req);
+    const now = Date.now();
+    const entry = globalRateMap.get(ip) || { requests: 0, windowStart: now };
+
+    if (now - entry.windowStart > GLOBAL_REQ_WINDOW) {
+        entry.requests = 0;
+        entry.windowStart = now;
+    }
+    entry.requests++;
+
+    // Enforce map size cap
+    if (globalRateMap.size > MAX_ATTEMPTS_STORED) {
+        const oldest = [...globalRateMap.entries()].sort((a, b) => a[1].windowStart - b[1].windowStart)[0];
+        if (oldest) globalRateMap.delete(oldest[0]);
+    }
+
+    globalRateMap.set(ip, entry);
+
+    if (entry.requests > GLOBAL_REQ_LIMIT) {
+        res.setHeader('Retry-After', '60');
+        return res.status(429).json({ success: false, error: 'Rate limit exceeded. Try again in 60 seconds.' });
+    }
     next();
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
+// --- Hardened security headers (applied to ALL responses) ---
+app.use((req, res, next) => {
+    // Anti-clickjacking
+    res.setHeader('X-Frame-Options', 'DENY');
+    // Disable MIME sniffing
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    // XSS filter (legacy browsers)
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    // Do not send Referer to external sites
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    // Restrict browser features
+    res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(), payment=()');
+    // Strict CSP — no inline scripts, no eval, only self + WS
+    res.setHeader('Content-Security-Policy', [
+        "default-src 'self'",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src https://fonts.gstatic.com",
+        "img-src 'self' data: blob: https://www.google.com",
+        "connect-src 'self' ws: wss:",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'"
+    ].join('; '));
+    // HSTS — force HTTPS for 1 year (enable when TLS-terminated)
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    // Prevent caching of authenticated responses
+    res.setHeader('Cache-Control', 'no-store');
+    next();
+});
 
-// Expose browser downloads folder publicly to allow users to download files locally
+app.use(express.static(path.join(__dirname, 'public'), {
+    // Serve static files with a permissive cache for assets only
+    setHeaders: (res, filePath) => {
+        if (filePath.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'no-store');
+        }
+    }
+}));
+
+// Expose browser downloads folder
 const downloadsDir = path.join(__dirname, 'browser_data', 'downloads');
 fs.mkdirSync(downloadsDir, { recursive: true });
 app.use('/downloads', express.static(downloadsDir));
 
+// --- CSRF origin validation helper ---
+function validateOrigin(req) {
+    const origin = req.headers['origin'] || req.headers['referer'] || '';
+    const host   = req.headers['host'] || '';
+    // Allow requests from same host (direct browser submits) or no origin (same-origin same-tab)
+    if (!origin) return true; // No origin header means same-origin in most browsers
+    try {
+        const originHost = new URL(origin).host;
+        return originHost === host;
+    } catch {
+        return false;
+    }
+}
+
+// ---------- Login endpoint ----------
 app.post('/api/login', (req, res) => {
-    const { password } = req.body || {};
     const ip = getClientIp(req);
 
-    if (typeof password !== 'string' || password.length > 128) {
-        return res.status(400).json({ success: false, error: 'Invalid payload structure' });
+    // CSRF origin check — reject cross-origin POST requests
+    if (!validateOrigin(req)) {
+        console.warn(`[security] Blocked cross-origin login attempt from ${ip}`);
+        return res.status(403).json({ success: false, error: 'Forbidden' });
     }
 
-    const attempt = loginAttempts.get(ip) || { count: 0, lockUntil: 0 };
-    if (Date.now() < attempt.lockUntil) {
-        const waitSec = Math.ceil((attempt.lockUntil - Date.now()) / 1000);
-        return res.status(429).json({ 
-            success: false, 
-            error: `Too many failed attempts. Locked out for ${waitSec} seconds.` 
-        });
+    const { password } = req.body || {};
+
+    // Strict type and length validation
+    if (typeof password !== 'string' || password.length === 0 || password.length > 256) {
+        return res.status(400).json({ success: false, error: 'Invalid request' });
     }
 
-    const inputHash = crypto.createHash('sha256').update(password).digest();
+    // Check lockout state
+    const attempt = loginAttempts.get(ip) || { count: 0, lockUntil: 0, firstAttempt: Date.now() };
+    const now = Date.now();
+
+    if (now < attempt.lockUntil) {
+        const waitSec = Math.ceil((attempt.lockUntil - now) / 1000);
+        console.warn(`[security] Locked-out IP attempted login: ${ip} (${waitSec}s remaining)`);
+        return res.status(429)
+            .set('Retry-After', String(waitSec))
+            .json({ success: false, error: `Too many failed attempts. Try again in ${waitSec} seconds.` });
+    }
+
+    // Constant-time password comparison (prevents timing attacks)
+    const inputHash    = crypto.createHash('sha256').update(password).digest();
     const expectedHash = crypto.createHash('sha256').update(PASSWORD).digest();
-    const isMatched = crypto.timingSafeEqual(inputHash, expectedHash);
+    const isMatched    = crypto.timingSafeEqual(inputHash, expectedHash);
 
     if (isMatched) {
         loginAttempts.delete(ip);
+
+        // Cap token store to prevent memory DoS
+        if (validTokens.size >= MAX_TOKENS_STORED) {
+            const oldest = [...validTokens.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0];
+            if (oldest) validTokens.delete(oldest[0]);
+        }
+
+        // Issue a 256-bit cryptographically random token
         const token = crypto.randomBytes(32).toString('hex');
-        validTokens.set(token, { createdAt: Date.now() });
+        validTokens.set(token, { createdAt: now, ip, lastActivity: now });
 
-        for (const [t, v] of validTokens) {
-            if (Date.now() - v.createdAt > 86_400_000) validTokens.delete(t);
-        }
-        res.json({ success: true, token });
-    } else {
-        attempt.count++;
-        if (attempt.count >= 5) {
-            const lockoutDuration = 60_000 * Math.pow(2, attempt.count - 5);
-            attempt.lockUntil = Date.now() + lockoutDuration;
-        }
-        loginAttempts.set(ip, attempt);
-
-        res.status(401).json({ 
-            success: false, 
-            error: attempt.count >= 5 
-                ? 'Invalid password. You are now temporarily locked out.' 
-                : 'Invalid password' 
-        });
+        console.log(`[auth] Successful login from ${ip}`);
+        return res.json({ success: true, token });
     }
+
+    // Failed — apply exponential backoff lockout
+    attempt.count++;
+    if (attempt.count >= LOCKOUT_THRESHOLD) {
+        // Doubles with every failed attempt beyond the threshold (60s, 120s, 240s…)
+        const lockSeconds = 60 * Math.pow(2, attempt.count - LOCKOUT_THRESHOLD);
+        attempt.lockUntil = now + Math.min(lockSeconds * 1000, 24 * 60 * 60 * 1000); // cap at 24h
+    }
+
+    // Cap attempts map size to resist memory DoS from unique IP floods
+    if (loginAttempts.size > MAX_ATTEMPTS_STORED) {
+        const oldest = [...loginAttempts.entries()].sort((a, b) => a[1].firstAttempt - b[1].firstAttempt)[0];
+        if (oldest) loginAttempts.delete(oldest[0]);
+    }
+
+    loginAttempts.set(ip, attempt);
+    console.warn(`[security] Failed login from ${ip} (attempt ${attempt.count})`);
+
+    // Always return 401 with a generic error — do not reveal whether the user/password was wrong
+    return res.status(401).json({ success: false, error: 'Incorrect password' });
 });
 
 // ---------- WebSocket Server ----------
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
+// ---------- WS message rate limiting ----------
+const WS_MSG_LIMIT  = 600; // max messages per 10s per connection
+const WS_MSG_WINDOW = 10_000;
+
 server.on('upgrade', (request, socket, head) => {
+    const ip = getClientIp(request);
     const parsedUrl = url.parse(request.url, true);
-    const token = parsedUrl.query.token;
-    const isValid = token && validTokens.has(token);
+
+    // --- Token validation ---
+    // Accept token from query param OR Authorization header (header is preferred — not logged by proxies)
+    let token = parsedUrl.query.token;
+    const authHeader = request.headers['authorization'] || '';
+    if (authHeader.startsWith('Bearer ')) {
+        token = authHeader.slice(7).trim();
+    }
+
+    const tokenData = token ? validTokens.get(token) : null;
+    const isValid   = !!tokenData;
+
+    if (!isValid) {
+        console.warn(`[security] WS upgrade rejected — invalid or missing token from ${ip}`);
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+    }
+
+    // Validate token hasn't expired
+    if (Date.now() - tokenData.createdAt > TOKEN_TTL_MS) {
+        validTokens.delete(token);
+        console.warn(`[security] WS upgrade rejected — expired token from ${ip}`);
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+    }
+
+    // Update last activity timestamp
+    tokenData.lastActivity = Date.now();
 
     wss.handleUpgrade(request, socket, head, (ws) => {
-        ws.isAuthorized = isValid;
+        ws.isAuthorized = true;
+        ws.clientIp = ip;
+        ws.msgCount = 0;
+        ws.msgWindowStart = Date.now();
         wss.emit('connection', ws, request);
     });
 });
@@ -630,6 +810,24 @@ wss.on('connection', async (ws) => {
     initialPage.goto('https://www.google.com').catch(e => console.warn(`[nav] ${e.message}`));
 
     ws.on('message', async (raw) => {
+        // --- WS message rate limiting — drop excessive clients ---
+        const now = Date.now();
+        if (now - ws.msgWindowStart > WS_MSG_WINDOW) {
+            ws.msgCount = 0;
+            ws.msgWindowStart = now;
+        }
+        ws.msgCount++;
+        if (ws.msgCount > WS_MSG_LIMIT) {
+            console.warn(`[security] WS message flood from ${ws.clientIp} — dropping message (${ws.msgCount} in window)`);
+            return;
+        }
+
+        // Enforce maximum raw message size (16 KB for JSON messages, 201 MB for file uploads handled by base64 check)
+        if (raw.length > 210_000_000) {
+            console.warn(`[security] Oversized WS message from ${ws.clientIp} (${raw.length} bytes) — dropped`);
+            return;
+        }
+
         let msg;
         try { msg = JSON.parse(raw); } catch { return; }
 

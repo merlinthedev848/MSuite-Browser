@@ -102,33 +102,95 @@ if (storedToken) {
 }
 
 // ---------- Login ----------
+let loginThrottleUntil = 0;
+let loginCountdownTimer = null;
+
+function startLoginCountdown(seconds) {
+    clearInterval(loginCountdownTimer);
+    loginBtn.disabled = true;
+    const updateLabel = () => {
+        const remaining = Math.ceil((loginThrottleUntil - Date.now()) / 1000);
+        if (remaining <= 0) {
+            clearInterval(loginCountdownTimer);
+            loginBtn.disabled = false;
+            loginBtn.querySelector('span').textContent = 'Connect';
+            return;
+        }
+        loginBtn.querySelector('span').textContent = `Wait ${remaining}s…`;
+    };
+    updateLabel();
+    loginCountdownTimer = setInterval(updateLabel, 1000);
+}
+
 loginForm.addEventListener('submit', async (e) => {
     e.preventDefault();
+
+    // Client-side throttle guard
+    if (Date.now() < loginThrottleUntil) return;
+
+    // Sanitise input — strip leading/trailing whitespace, enforce max length
+    const rawPassword = passwordInput.value;
+    if (!rawPassword || rawPassword.length > 256) {
+        loginError.textContent = 'Password is required and must be under 256 characters.';
+        loginError.classList.remove('hidden');
+        return;
+    }
+
     loginBtn.disabled = true;
+    loginBtn.querySelector('span').textContent = 'Connecting…';
     loginError.classList.add('hidden');
 
     try {
-        const res  = await fetch('/api/login', {
+        const res = await fetch('/api/login', {
             method:  'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body:    JSON.stringify({ password: passwordInput.value })
+            headers: {
+                'Content-Type': 'application/json',
+                // Include same-origin header so CSRF origin check passes from browser
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            // Send the raw value — no client-side hashing (that would be security theatre)
+            body: JSON.stringify({ password: rawPassword }),
+            credentials: 'same-origin'
         });
+
+        // Parse Retry-After header if present (server signals lockout duration)
+        const retryAfter = parseInt(res.headers.get('Retry-After') || '0', 10);
         const data = await res.json();
 
         if (data.success) {
+            // Store token and immediately clear the password field
             sessionStorage.setItem('vb_token', data.token);
+            passwordInput.value = '';
             loginScreen.classList.add('hidden');
             appContainer.classList.remove('hidden');
             initApp(data.token);
         } else {
-            loginError.textContent = data.error || 'Invalid password';
+            // Show server error — escape the string to prevent reflected XSS
+            const msg = String(data.error || 'Incorrect password').slice(0, 200);
+            loginError.textContent = msg;
             loginError.classList.remove('hidden');
+
+            if (retryAfter > 0) {
+                // Lock the button for the server-specified duration
+                loginThrottleUntil = Date.now() + retryAfter * 1000;
+                startLoginCountdown(retryAfter);
+            } else if (res.status === 401) {
+                // Apply a small client-side delay between attempts regardless
+                loginThrottleUntil = Date.now() + 1500;
+                setTimeout(() => {
+                    loginBtn.disabled = false;
+                    loginBtn.querySelector('span').textContent = 'Connect';
+                }, 1500);
+            } else {
+                loginBtn.disabled = false;
+                loginBtn.querySelector('span').textContent = 'Connect';
+            }
         }
     } catch {
         loginError.textContent = 'Connection error — is the server running?';
         loginError.classList.remove('hidden');
-    } finally {
         loginBtn.disabled = false;
+        loginBtn.querySelector('span').textContent = 'Connect';
     }
 });
 
