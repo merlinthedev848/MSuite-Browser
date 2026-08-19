@@ -151,13 +151,19 @@ function sendTabState(ws) {
 }
 
 // ---------- Screencast Control ----------
-async function startScreencast(client) {
-    await client.send('Page.startScreencast', {
-        format: 'png',
+async function startScreencast(client, ws) {
+    const format = ws?.streamFormat || 'jpeg';
+    const quality = ws?.streamQuality || 90;
+    const params = {
+        format,
         maxWidth: 1920,
         maxHeight: 1080,
         everyNthFrame: 1
-    }).catch(() => {});
+    };
+    if (format === 'jpeg') {
+        params.quality = quality;
+    }
+    await client.send('Page.startScreencast', params).catch(() => {});
 }
 
 async function stopScreencast(client) {
@@ -343,7 +349,7 @@ async function switchTab(ws, tabId) {
     sendTabState(ws);
     ws.send(JSON.stringify({ type: 'url_changed', url: t.url }));
 
-    await startScreencast(t.client);
+    await startScreencast(t.client, ws);
 }
 
 async function closeTab(ws, tabId) {
@@ -437,6 +443,8 @@ wss.on('connection', async (ws) => {
     ws.tabCounter = 0;
     ws.adblockerEnabled = true;
     ws.currentUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+    ws.streamFormat = 'jpeg';
+    ws.streamQuality = 90;
 
     let waited = 0;
     while (browserStarting && waited < 60_000) {
@@ -541,6 +549,9 @@ wss.on('connection', async (ws) => {
                 if (typeof msg.enabled !== 'boolean') return;
             } else if (msg.type === 'set_useragent') {
                 if (typeof msg.userAgent !== 'string' || msg.userAgent.length > 512) return;
+            } else if (msg.type === 'set_stream_quality') {
+                if (typeof msg.format !== 'string' || !['png', 'jpeg'].includes(msg.format)) return;
+                if (msg.quality !== undefined && typeof msg.quality !== 'number') return;
             }
         } catch {
             return;
@@ -616,6 +627,18 @@ wss.on('connection', async (ws) => {
                     tab.page.reload().catch(() => {});
                 }
                 console.log(`[session] User-Agent updated to: ${targetUA}`);
+                return;
+            }
+
+            if (msg.type === 'set_stream_quality') {
+                ws.streamFormat = msg.format;
+                ws.streamQuality = msg.quality || 90;
+                if (ws.activeTabId && ws.tabs.has(ws.activeTabId)) {
+                    const t = ws.tabs.get(ws.activeTabId);
+                    await stopScreencast(t.client);
+                    await startScreencast(t.client, ws);
+                }
+                console.log(`[session] Stream quality updated to: ${msg.format} (quality: ${msg.quality || 'N/A'})`);
                 return;
             }
 

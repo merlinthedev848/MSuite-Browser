@@ -39,6 +39,15 @@ const bookmarksContainer = document.getElementById('bookmarks-container');
 const addBookmarkBtn    = document.getElementById('add-bookmark-btn');
 
 const loadingProgress   = document.getElementById('loading-progress');
+const qualitySelect     = document.getElementById('quality-select');
+
+const contextMenu       = document.getElementById('context-menu');
+const ctxBack           = document.getElementById('ctx-back');
+const ctxForward        = document.getElementById('ctx-forward');
+const ctxReload         = document.getElementById('ctx-reload');
+const ctxNewTab         = document.getElementById('ctx-newtab');
+const ctxAdblock        = document.getElementById('ctx-adblock');
+const ctxClear          = document.getElementById('ctx-clear');
 
 // ---------- State ----------
 let ws = null;
@@ -107,7 +116,7 @@ function connectWS(token) {
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/?token=${token}`);
-    ws.binaryType = 'blob';
+    ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
         statusDot.classList.replace('disconnected', 'connected');
@@ -138,13 +147,15 @@ function connectWS(token) {
         let isBinary = false;
         let blob = null;
 
-        if (event.data instanceof Blob) {
+        if (event.data instanceof ArrayBuffer) {
             isBinary = true;
-            // Explicitly force image/png type so the browser's native decoder uses the fast path
-            blob = event.data.type === 'image/png' ? event.data : new Blob([event.data], { type: 'image/png' });
-        } else if (event.data instanceof ArrayBuffer) {
-            isBinary = true;
-            blob = new Blob([event.data], { type: 'image/png' });
+            const view = new Uint8Array(event.data);
+            let mime = 'image/jpeg';
+            // PNG magic bytes check: 89 50 4E 47
+            if (view[0] === 0x89 && view[1] === 0x50 && view[2] === 0x4E && view[3] === 0x47) {
+                mime = 'image/png';
+            }
+            blob = new Blob([event.data], { type: mime });
         }
 
         if (isBinary && blob) {
@@ -207,6 +218,9 @@ function connectWS(token) {
                 clipText.classList.remove('clip-glow-anim');
                 void clipText.offsetWidth; // Trigger reflow
                 clipText.classList.add('clip-glow-anim');
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(msg.text).catch(() => {});
+                }
                 break;
 
             case 'auth_error':
@@ -408,6 +422,28 @@ window.addEventListener('keydown', (e) => {
     if (document.activeElement !== viewportContainer) return;
 
     const isCmdOrCtrl = e.ctrlKey || e.metaKey;
+
+    // Ctrl + V (Paste from local desktop clipboard)
+    if (isCmdOrCtrl && e.key.toLowerCase() === 'v') {
+        e.preventDefault();
+        if (navigator.clipboard && navigator.clipboard.readText) {
+            navigator.clipboard.readText()
+                .then(text => {
+                    if (text) sendMsg({ type: 'type', text });
+                })
+                .catch(() => {
+                    // Fallback to clipboard sync modal if permission is not granted
+                    clipModal.classList.remove('hidden');
+                    clipText.focus();
+                    clipText.select();
+                });
+        } else {
+            clipModal.classList.remove('hidden');
+            clipText.focus();
+            clipText.select();
+        }
+        return;
+    }
 
     if (isCmdOrCtrl && e.key.toLowerCase() === 't') {
         e.preventDefault();
@@ -641,3 +677,89 @@ addBookmarkBtn.addEventListener('click', () => {
 
 // Initialize bookmarks
 loadBookmarks();
+
+// ---------- Stream Performance Settings ----------
+qualitySelect.addEventListener('change', () => {
+    const val = qualitySelect.value;
+    if (val === 'png') {
+        sendMsg({ type: 'set_stream_quality', format: 'png' });
+    } else if (val === 'jpeg_98') {
+        sendMsg({ type: 'set_stream_quality', format: 'jpeg', quality: 98 });
+    } else {
+        sendMsg({ type: 'set_stream_quality', format: 'jpeg', quality: 90 });
+    }
+});
+
+// ---------- Custom Context Menu ----------
+overlay.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    contextMenu.classList.remove('hidden');
+    
+    // Position menu exactly under cursor, checking boundaries
+    const menuW = 180;
+    const menuH = 200;
+    let x = e.clientX;
+    let y = e.clientY;
+
+    if (x + menuW > window.innerWidth) x = window.innerWidth - menuW - 10;
+    if (y + menuH > window.innerHeight) y = window.innerHeight - menuH - 10;
+
+    contextMenu.style.left = `${x}px`;
+    contextMenu.style.top = `${y}px`;
+});
+
+// Hide context menu on left click anywhere
+document.addEventListener('click', () => {
+    contextMenu.classList.add('hidden');
+});
+
+// Context Menu Action Listeners
+ctxBack.addEventListener('click', () => sendMsg({ type: 'back' }));
+ctxForward.addEventListener('click', () => sendMsg({ type: 'forward' }));
+ctxReload.addEventListener('click', () => sendMsg({ type: 'reload' }));
+ctxNewTab.addEventListener('click', () => sendMsg({ type: 'new_tab' }));
+ctxAdblock.addEventListener('click', () => {
+    adblockToggle.checked = !adblockToggle.checked;
+    sendMsg({ type: 'toggle_adblocker', enabled: adblockToggle.checked });
+});
+ctxClear.addEventListener('click', () => {
+    if (confirm('Are you sure you want to clear session cookies, permissions, and cache?')) {
+        sendMsg({ type: 'clear_session' });
+    }
+});
+
+// ---------- Windows-Style Titlebar Window Control Actions ----------
+const winMinimize = document.querySelector('.win-minimize');
+const winMaximize = document.querySelector('.win-maximize');
+const winClose    = document.querySelector('.win-close');
+
+if (winMinimize) {
+    winMinimize.addEventListener('click', () => {
+        // Minimize: logout/return to login screen cleanly
+        if (ws) ws.close();
+        appContainer.classList.add('hidden');
+        loginScreen.classList.remove('hidden');
+        passwordInput.value = '';
+        passwordInput.focus();
+    });
+}
+if (winMaximize) {
+    winMaximize.addEventListener('click', () => {
+        // Maximize: Request full screen
+        if (!document.fullscreenElement) {
+            document.documentElement.requestFullscreen().catch(() => {});
+        } else {
+            document.exitFullscreen().catch(() => {});
+        }
+    });
+}
+if (winClose) {
+    winClose.addEventListener('click', () => {
+        if (confirm('Are you sure you want to close the browser session and exit?')) {
+            if (ws) ws.close();
+            appContainer.classList.add('hidden');
+            loginScreen.classList.remove('hidden');
+            passwordInput.value = '';
+        }
+    });
+}

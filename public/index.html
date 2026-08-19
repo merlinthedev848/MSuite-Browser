@@ -41,13 +41,26 @@
 
     <!-- Main Browser UI -->
     <div id="app-container" class="app-container hidden" aria-label="Remote browser">
-        <!-- Toolbar -->
-        <header class="toolbar">
-            <div class="window-controls" aria-hidden="true">
-                <span class="dot close"></span>
-                <span class="dot minimize"></span>
-                <span class="dot maximize"></span>
+        <!-- Tab Bar (Windows Style: Top of Window) -->
+        <div class="tab-bar" role="tablist" aria-label="Browser tabs">
+            <div class="tabs-container" id="tabs-container">
+                <!-- Tabs injected dynamically -->
             </div>
+            <button id="new-tab-btn" class="new-tab-btn" title="New Tab" aria-label="Open new tab">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                </svg>
+            </button>
+            <div class="window-controls-win" aria-hidden="true">
+                <button class="win-btn win-minimize" tabindex="-1" title="Minimize">—</button>
+                <button class="win-btn win-maximize" tabindex="-1" title="Maximize">▢</button>
+                <button class="win-btn win-close" tabindex="-1" title="Close">✕</button>
+            </div>
+        </div>
+
+        <!-- Toolbar (Windows Style: Below Tab Bar) -->
+        <header class="toolbar">
             <div class="nav-buttons">
                 <button id="back-btn" class="nav-btn" aria-label="Go Back" title="Back">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -96,19 +109,6 @@
                 </svg>
             </button>
         </header>
-
-        <!-- Tab Bar -->
-        <div class="tab-bar" role="tablist" aria-label="Browser tabs">
-            <div class="tabs-container" id="tabs-container">
-                <!-- Tabs injected dynamically -->
-            </div>
-            <button id="new-tab-btn" class="new-tab-btn" title="New Tab" aria-label="Open new tab">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                    <line x1="12" y1="5" x2="12" y2="19"></line>
-                    <line x1="5" y1="12" x2="19" y2="12"></line>
-                </svg>
-            </button>
-        </div>
 
         <!-- Bookmarks Bar -->
         <div class="bookmarks-bar" id="bookmarks-bar">
@@ -179,10 +179,29 @@
                     </select>
                     <input type="text" id="custom-ua-input" class="hidden" placeholder="Enter custom User-Agent..." autocomplete="off" spellcheck="false" />
                 </div>
+                <div class="settings-group">
+                    <label for="quality-select">Stream Performance</label>
+                    <select id="quality-select">
+                        <option value="jpeg_90" selected>Fast - Balanced (JPEG 90)</option>
+                        <option value="jpeg_98">High Quality - Crisp (JPEG 98)</option>
+                        <option value="png">Lossless - Pixel-Perfect (PNG)</option>
+                    </select>
+                </div>
                 <div class="settings-group actions">
                     <button id="clear-session-btn" class="btn-danger">Clear Cookies & Cache</button>
                 </div>
             </div>
+        </div>
+
+        <!-- Custom Context Menu -->
+        <div id="context-menu" class="context-menu hidden" role="menu">
+            <button class="context-menu-item" id="ctx-back" role="menuitem">⬅️ Back (Alt+Left)</button>
+            <button class="context-menu-item" id="ctx-forward" role="menuitem">➡️ Forward (Alt+Right)</button>
+            <button class="context-menu-item" id="ctx-reload" role="menuitem">🔄 Reload (F5)</button>
+            <hr class="context-menu-separator" />
+            <button class="context-menu-item" id="ctx-newtab" role="menuitem">➕ New Tab</button>
+            <button class="context-menu-item" id="ctx-adblock" role="menuitem">🛡️ Toggle Adblocker</button>
+            <button class="context-menu-item" id="ctx-clear" role="menuitem">🧹 Clear Session Data</button>
         </div>
     </div>
 
