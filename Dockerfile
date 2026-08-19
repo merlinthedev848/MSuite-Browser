@@ -19,9 +19,8 @@ RUN apt-get update && apt-get install -y \
     tor \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Playwright browsers and their OS dependencies
-# Playwright provides a command to install all necessary system libraries for Chromium
-RUN npx playwright install chromium --with-deps
+# Install Playwright official Google Chrome with system dependencies
+RUN npx playwright install chrome --with-deps
 
 # Copy application source code
 COPY . .

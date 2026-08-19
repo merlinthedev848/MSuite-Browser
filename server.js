@@ -396,9 +396,10 @@ async function startBrowser() {
             return null;
         });
 
-        console.log('[*] Launching Chromium...');
+        console.log('[*] Launching Google Chrome...');
         browser = await chromium.launch({
             headless: true,
+            channel: 'chrome',
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
