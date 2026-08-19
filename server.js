@@ -164,14 +164,130 @@ async function stopScreencast(client) {
     await client.send('Page.stopScreencast').catch(() => {});
 }
 
+async function renderErrorPage(page, url, errorMessage) {
+    if (page.isClosed()) return;
+    const errorHtml = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Navigation Error</title>
+        <style>
+            body {
+                background-color: #0f172a;
+                color: #f8fafc;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                margin: 0;
+                padding: 20px;
+                box-sizing: border-box;
+            }
+            .container {
+                max-width: 500px;
+                text-align: center;
+                background: #1e293b;
+                border: 1px solid #334155;
+                border-radius: 12px;
+                padding: 32px;
+                box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3);
+            }
+            h1 {
+                font-size: 22px;
+                margin-top: 0;
+                color: #ef4444;
+            }
+            p {
+                font-size: 14px;
+                color: #94a3b8;
+                line-height: 1.6;
+                word-break: break-all;
+            }
+            .url {
+                font-family: monospace;
+                background: #0f172a;
+                padding: 6px 10px;
+                border-radius: 6px;
+                border: 1px solid #1e293b;
+                margin: 16px 0;
+            }
+            .btn {
+                background: #3b82f6;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 10px 20px;
+                font-size: 14px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: background 0.15s;
+                margin-top: 16px;
+            }
+            .btn:hover {
+                background: #2563eb;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Navigation Failed</h1>
+            <p>The virtual browser was unable to load the requested website:</p>
+            <div class="url">${url}</div>
+            <p><strong>Error:</strong> ${errorMessage}</p>
+            <button class="btn" onclick="location.reload()">Retry Connection</button>
+        </div>
+    </body>
+    </html>
+    `;
+    await page.setContent(errorHtml).catch(() => {});
+}
+
 // ---------- Connection-scoped Tab Management ----------
 async function createTab(ws) {
     const tabId = 'tab_' + (++ws.tabCounter);
     const page = await ws.context.newPage();
 
-    if (adblocker) {
+    // Spoof UA dynamically on page level
+    const targetUA = ws.currentUserAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+    await page.addInitScript((ua) => {
+        window.__customUA = ua;
+    }, targetUA).catch(() => {});
+
+    if (adblocker && ws.adblockerEnabled) {
         await adblocker.enableBlockingInPage(page).catch(() => {});
     }
+
+    // Monitor page load events to broadcast load state to the client
+    page.on('domcontentloaded', () => {
+        if (tabId === ws.activeTabId && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'loading_state', loading: false }));
+        }
+    });
+    page.on('load', () => {
+        if (tabId === ws.activeTabId && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'loading_state', loading: false }));
+        }
+    });
+    page.on('request', (req) => {
+        try {
+            if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+                if (tabId === ws.activeTabId && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'loading_state', loading: true }));
+                }
+            }
+        } catch (_) {}
+    });
+    page.on('requestfailed', (req) => {
+        try {
+            if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+                if (tabId === ws.activeTabId && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'loading_state', loading: false }));
+                }
+            }
+        } catch (_) {}
+    });
 
     const client = await page.context().newCDPSession(page);
     await client.send('Page.enable');
@@ -319,6 +435,8 @@ wss.on('connection', async (ws) => {
     ws.tabs = new Map();
     ws.activeTabId = null;
     ws.tabCounter = 0;
+    ws.adblockerEnabled = true;
+    ws.currentUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
     let waited = 0;
     while (browserStarting && waited < 60_000) {
@@ -395,6 +513,39 @@ wss.on('connection', async (ws) => {
         let msg;
         try { msg = JSON.parse(raw); } catch { return; }
 
+        // --- Payload Validation & Sanitation ---
+        try {
+            if (!msg || typeof msg.type !== 'string') return;
+
+            if (msg.type === 'mousemove' || msg.type === 'mousedown' || msg.type === 'mouseup') {
+                if (typeof msg.x !== 'number' || typeof msg.y !== 'number') return;
+                msg.x = Math.max(0, Math.min(1920, Math.round(msg.x)));
+                msg.y = Math.max(0, Math.min(1080, Math.round(msg.y)));
+                if (msg.button && !['left', 'middle', 'right'].includes(msg.button)) return;
+            } else if (msg.type === 'wheel') {
+                if (typeof msg.deltaX !== 'number' || typeof msg.deltaY !== 'number') return;
+                msg.deltaX = Math.max(-5000, Math.min(5000, msg.deltaX));
+                msg.deltaY = Math.max(-5000, Math.min(5000, msg.deltaY));
+            } else if (msg.type === 'keydown' || msg.type === 'keyup') {
+                if (typeof msg.key !== 'string' || msg.key.length > 50) return;
+                if (msg.modifiers && (!Array.isArray(msg.modifiers) || msg.modifiers.some(m => typeof m !== 'string' || m.length > 20))) return;
+            } else if (msg.type === 'goto') {
+                if (typeof msg.url !== 'string' || msg.url.length > 2048) return;
+            } else if (msg.type === 'type') {
+                if (typeof msg.text !== 'string' || msg.text.length > 10000) return;
+            } else if (msg.type === 'new_tab') {
+                if (msg.url && (typeof msg.url !== 'string' || msg.url.length > 2048)) return;
+            } else if (msg.type === 'switch_tab' || msg.type === 'close_tab') {
+                if (typeof msg.tabId !== 'string' || !/^tab_\d+$/.test(msg.tabId)) return;
+            } else if (msg.type === 'toggle_adblocker') {
+                if (typeof msg.enabled !== 'boolean') return;
+            } else if (msg.type === 'set_useragent') {
+                if (typeof msg.userAgent !== 'string' || msg.userAgent.length > 512) return;
+            }
+        } catch {
+            return;
+        }
+
         try {
             if (msg.type === 'frame_ack') {
                 if (ws.ackTimeout) {
@@ -414,11 +565,59 @@ wss.on('connection', async (ws) => {
                 const id = await createTab(ws);
                 await switchTab(ws, id);
                 const p = ws.tabs.get(id).page;
-                p.goto(msg.url || 'https://www.google.com').catch(e => console.warn(`[nav] ${e.message}`));
+                p.goto(msg.url || 'https://www.google.com').catch(e => {
+                    console.warn(`[nav] ${e.message}`);
+                    renderErrorPage(p, msg.url || 'https://www.google.com', e.message);
+                });
                 return;
             }
             if (msg.type === 'switch_tab') { await switchTab(ws, msg.tabId); return; }
             if (msg.type === 'close_tab')  { await closeTab(ws, msg.tabId);  return; }
+
+            // Session Settings handlers
+            if (msg.type === 'clear_session') {
+                if (ws.context) {
+                    await ws.context.clearCookies().catch(() => {});
+                    for (const tab of ws.tabs.values()) {
+                        tab.page.reload().catch(() => {});
+                    }
+                    console.log('[session] Cleared all session cookies and reloaded pages.');
+                }
+                return;
+            }
+
+            if (msg.type === 'toggle_adblocker') {
+                ws.adblockerEnabled = msg.enabled;
+                if (adblocker) {
+                    for (const tab of ws.tabs.values()) {
+                        if (msg.enabled) {
+                            await adblocker.enableBlockingInPage(tab.page).catch(() => {});
+                        } else {
+                            await adblocker.disableBlockingInPage(tab.page).catch(() => {});
+                        }
+                    }
+                }
+                console.log(`[session] Adblocker state toggled to: ${msg.enabled}`);
+                return;
+            }
+
+            if (msg.type === 'set_useragent') {
+                const profiles = {
+                    desktop: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                    mobile: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1'
+                };
+                const targetUA = profiles[msg.userAgent] || msg.userAgent;
+                ws.currentUserAgent = targetUA;
+
+                for (const tab of ws.tabs.values()) {
+                    await tab.page.evaluate((ua) => {
+                        window.__customUA = ua;
+                    }, targetUA).catch(() => {});
+                    tab.page.reload().catch(() => {});
+                }
+                console.log(`[session] User-Agent updated to: ${targetUA}`);
+                return;
+            }
 
             if (!ws.activeTabId || !ws.tabs.has(ws.activeTabId)) return;
             const p = ws.tabs.get(ws.activeTabId).page;
@@ -487,13 +686,18 @@ wss.on('connection', async (ws) => {
                     }
                     console.log(`[ws] Final resolved navigation target: "${target}"`);
                     
-                    p.goto(target).catch(async (e) => {
+                    const activePage = p;
+                    activePage.goto(target).catch(async (e) => {
                         console.warn(`[nav] ${e.message}`);
-                        // If HTTPS fails and we auto-prepended it, fall back to HTTP
                         if (isAutoprepended && target.startsWith('https://')) {
                             const fallbackUrl = target.replace('https://', 'http://');
                             console.log(`[ws] HTTPS failed, trying HTTP fallback: "${fallbackUrl}"`);
-                            await p.goto(fallbackUrl).catch(err => console.warn(`[nav fallback] ${err.message}`));
+                            await activePage.goto(fallbackUrl).catch(err => {
+                                console.warn(`[nav fallback] ${err.message}`);
+                                renderErrorPage(activePage, target, err.message);
+                            });
+                        } else {
+                            renderErrorPage(activePage, target, e.message);
                         }
                     });
                     break;

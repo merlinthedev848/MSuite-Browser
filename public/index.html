@@ -83,10 +83,16 @@
                 <span class="status-dot disconnected" aria-hidden="true"></span>
                 <span class="status-text">Disconnected</span>
             </div>
-            <button id="clip-btn" class="clip-btn" title="Clipboard Sync" aria-label="View synced clipboard">
+            <button id="clip-btn" class="toolbar-btn" title="Clipboard Sync" aria-label="View synced clipboard">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
                     <rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect>
+                </svg>
+            </button>
+            <button id="settings-btn" class="toolbar-btn" title="Session Settings" aria-label="Open settings panel">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="3"></circle>
+                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
                 </svg>
             </button>
         </header>
@@ -104,8 +110,24 @@
             </button>
         </div>
 
+        <!-- Bookmarks Bar -->
+        <div class="bookmarks-bar" id="bookmarks-bar">
+            <div class="bookmarks-container" id="bookmarks-container">
+                <!-- Bookmarks injected dynamically -->
+            </div>
+            <button id="add-bookmark-btn" title="Bookmark current page" aria-label="Add bookmark">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path>
+                </svg>
+            </button>
+        </div>
+
         <!-- Browser Display -->
         <main class="browser-viewport">
+            <!-- Progress Bar -->
+            <div class="progress-bar-container">
+                <div id="loading-progress" class="progress-bar"></div>
+            </div>
             <div class="loading-overlay" id="loading-overlay" role="status">
                 <div class="spinner" aria-hidden="true"></div>
                 <p id="loading-text">Initializing Stream...</p>
@@ -129,6 +151,37 @@
             <textarea id="clip-text" placeholder="Type or paste content here..." autocomplete="off" spellcheck="false"></textarea>
             <div class="clip-modal-actions">
                 <button id="clip-push-btn">Send text to remote cursor</button>
+            </div>
+        </div>
+
+        <!-- Settings Modal -->
+        <div id="settings-modal" class="settings-modal hidden" role="dialog" aria-labelledby="settings-modal-title">
+            <div class="settings-modal-header">
+                <h3 id="settings-modal-title">Session Settings</h3>
+                <button id="settings-close-btn" aria-label="Close settings panel">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+            </div>
+            <div class="settings-body">
+                <div class="settings-group">
+                    <label class="toggle-control">
+                        <span>Enable Adblocker</span>
+                        <input type="checkbox" id="adblock-toggle" checked />
+                        <span class="control-indicator"></span>
+                    </label>
+                </div>
+                <div class="settings-group">
+                    <label for="ua-select">User-Agent Profile</label>
+                    <select id="ua-select">
+                        <option value="desktop">Desktop Chrome (Windows)</option>
+                        <option value="mobile">Mobile Safari (iPhone)</option>
+                        <option value="custom">Custom User-Agent</option>
+                    </select>
+                    <input type="text" id="custom-ua-input" class="hidden" placeholder="Enter custom User-Agent..." autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="settings-group actions">
+                    <button id="clear-session-btn" class="btn-danger">Clear Cookies & Cache</button>
+                </div>
             </div>
         </div>
     </div>

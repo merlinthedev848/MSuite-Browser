@@ -26,10 +26,26 @@ const clipCloseBtn     = document.getElementById('clip-close-btn');
 const clipText         = document.getElementById('clip-text');
 const clipPushBtn      = document.getElementById('clip-push-btn');
 
+const settingsBtn       = document.getElementById('settings-btn');
+const settingsModal     = document.getElementById('settings-modal');
+const settingsCloseBtn  = document.getElementById('settings-close-btn');
+const adblockToggle     = document.getElementById('adblock-toggle');
+const uaSelect          = document.getElementById('ua-select');
+const customUaInput     = document.getElementById('custom-ua-input');
+const clearSessionBtn   = document.getElementById('clear-session-btn');
+
+const bookmarksBar      = document.getElementById('bookmarks-bar');
+const bookmarksContainer = document.getElementById('bookmarks-container');
+const addBookmarkBtn    = document.getElementById('add-bookmark-btn');
+
+const loadingProgress   = document.getElementById('loading-progress');
+
 // ---------- State ----------
 let ws = null;
 let appInitialized = false;
 let reconnectTimer = null;
+let activeTabId = null;
+let loadingTimer = null;
 
 // Double buffer variables for flicker-free streaming
 let activeImg = imgA;
@@ -201,8 +217,32 @@ function connectWS(token) {
                 loginError.classList.remove('hidden');
                 ws.close();
                 break;
+
+            case 'loading_state':
+                handleLoadingState(msg.loading);
+                break;
         }
     };
+}
+
+function handleLoadingState(loading) {
+    if (loading) {
+        clearTimeout(loadingTimer);
+        loadingProgress.style.opacity = '1';
+        loadingProgress.style.width = '0%';
+        void loadingProgress.offsetWidth; // Trigger reflow
+        loadingProgress.style.transition = 'width 2s cubic-bezier(0.1, 0.8, 0.3, 1)';
+        loadingProgress.style.width = '90%';
+    } else {
+        loadingProgress.style.transition = 'width 0.3s ease';
+        loadingProgress.style.width = '100%';
+        loadingTimer = setTimeout(() => {
+            loadingProgress.style.opacity = '0';
+            loadingTimer = setTimeout(() => {
+                loadingProgress.style.width = '0%';
+            }, 300);
+        }, 300);
+    }
 }
 
 // ---------- Overlay ----------
@@ -229,6 +269,9 @@ function renderTabs(tabs) {
 
     tabs.forEach(tab => {
         seenIds.add(tab.id);
+        if (tab.isActive) {
+            activeTabId = tab.id;
+        }
         let tabEl = tabDomMap.get(tab.id);
 
         if (!tabEl) {
@@ -364,6 +407,36 @@ window.addEventListener('keydown', (e) => {
     if (document.activeElement === urlInput || document.activeElement === passwordInput) return;
     if (document.activeElement !== viewportContainer) return;
 
+    const isCmdOrCtrl = e.ctrlKey || e.metaKey;
+
+    if (isCmdOrCtrl && e.key.toLowerCase() === 't') {
+        e.preventDefault();
+        sendMsg({ type: 'new_tab' });
+        return;
+    }
+    if (isCmdOrCtrl && e.key.toLowerCase() === 'w') {
+        e.preventDefault();
+        if (activeTabId) {
+            sendMsg({ type: 'close_tab', tabId: activeTabId });
+        }
+        return;
+    }
+    if ((isCmdOrCtrl && e.key.toLowerCase() === 'r') || e.key === 'F5') {
+        e.preventDefault();
+        sendMsg({ type: 'reload' });
+        return;
+    }
+    if (e.altKey && e.key === 'ArrowLeft') {
+        e.preventDefault();
+        sendMsg({ type: 'back' });
+        return;
+    }
+    if (e.altKey && e.key === 'ArrowRight') {
+        e.preventDefault();
+        sendMsg({ type: 'forward' });
+        return;
+    }
+
     if (e.ctrlKey || e.metaKey || e.altKey || INTERCEPT_KEYS.has(e.key)) {
         e.preventDefault();
     }
@@ -425,3 +498,146 @@ clipPushBtn.addEventListener('click', () => {
         viewportContainer.focus();
     }
 });
+
+// ---------- Settings Panel ----------
+settingsBtn.addEventListener('click', () => {
+    settingsModal.classList.toggle('hidden');
+    clipModal.classList.add('hidden'); // prevent overlapping
+});
+
+settingsCloseBtn.addEventListener('click', () => {
+    settingsModal.classList.add('hidden');
+});
+
+adblockToggle.addEventListener('change', () => {
+    sendMsg({ type: 'toggle_adblocker', enabled: adblockToggle.checked });
+});
+
+uaSelect.addEventListener('change', () => {
+    const val = uaSelect.value;
+    if (val === 'custom') {
+        customUaInput.classList.remove('hidden');
+        customUaInput.focus();
+    } else {
+        customUaInput.classList.add('hidden');
+        sendMsg({ type: 'set_useragent', userAgent: val });
+    }
+});
+
+customUaInput.addEventListener('blur', () => {
+    const ua = customUaInput.value.trim();
+    if (ua) {
+        sendMsg({ type: 'set_useragent', userAgent: ua });
+    }
+});
+
+customUaInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        customUaInput.blur();
+        viewportContainer.focus();
+    }
+});
+
+clearSessionBtn.addEventListener('click', () => {
+    if (confirm('Are you sure you want to clear session cookies, permissions, and cache?')) {
+        sendMsg({ type: 'clear_session' });
+        settingsModal.classList.add('hidden');
+    }
+});
+
+// ---------- Bookmarks Bar ----------
+const DEFAULT_BOOKMARKS = [
+    { name: 'Google', url: 'https://www.google.com' },
+    { name: 'YouTube', url: 'https://www.youtube.com' },
+    { name: 'GitHub', url: 'https://github.com' }
+];
+
+let bookmarks = [];
+
+function loadBookmarks() {
+    try {
+        const stored = localStorage.getItem('vb_bookmarks');
+        if (stored) {
+            bookmarks = JSON.parse(stored);
+        } else {
+            bookmarks = [...DEFAULT_BOOKMARKS];
+            saveBookmarks();
+        }
+    } catch {
+        bookmarks = [...DEFAULT_BOOKMARKS];
+    }
+    renderBookmarks();
+}
+
+function saveBookmarks() {
+    try {
+        localStorage.setItem('vb_bookmarks', JSON.stringify(bookmarks));
+    } catch (_) {}
+}
+
+function renderBookmarks() {
+    bookmarksContainer.innerHTML = '';
+    bookmarks.forEach((bm, index) => {
+        const item = document.createElement('div');
+        item.className = 'bookmark-item';
+        
+        // Simple favicon helper
+        const icon = document.createElement('img');
+        icon.className = 'bookmark-item-icon';
+        
+        let domain = bm.url;
+        try { domain = new URL(bm.url).hostname; } catch (_) {}
+        icon.src = `https://www.google.com/s2/favicons?domain=${domain}&sz=16`;
+        icon.onerror = () => { icon.style.display = 'none'; };
+
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = bm.name;
+
+        item.appendChild(icon);
+        item.appendChild(nameSpan);
+
+        item.addEventListener('click', () => {
+            urlInput.value = bm.url;
+            navigate();
+        });
+
+        // Right click to delete bookmark
+        item.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            if (confirm(`Remove bookmark "${bm.name}"?`)) {
+                bookmarks.splice(index, 1);
+                saveBookmarks();
+                renderBookmarks();
+            }
+        });
+
+        bookmarksContainer.appendChild(item);
+    });
+}
+
+addBookmarkBtn.addEventListener('click', () => {
+    const urlVal = urlInput.value.trim();
+    if (!urlVal) return;
+
+    let targetUrl = urlVal;
+    if (!/^https?:\/\//i.test(targetUrl)) {
+        targetUrl = 'https://' + targetUrl;
+    }
+
+    let hostname = 'Bookmark';
+    try {
+        hostname = new URL(targetUrl).hostname.replace('www.', '');
+    } catch (_) {
+        hostname = targetUrl;
+    }
+
+    const name = prompt('Enter bookmark name:', hostname);
+    if (name === null) return; // cancelled
+
+    bookmarks.push({ name: name.trim() || hostname, url: targetUrl });
+    saveBookmarks();
+    renderBookmarks();
+});
+
+// Initialize bookmarks
+loadBookmarks();
