@@ -60,14 +60,60 @@ const GLOBAL_REQ_WINDOW   = 60_000;
 const MAX_ATTEMPTS_STORED = 5_000;                // cap map size to resist memory DoS
 const MAX_TOKENS_STORED   = 500;
 
+const SESSIONS_FILE = path.join(__dirname, 'browser_data', 'sessions.json');
+
+function loadSessions() {
+    try {
+        if (fs.existsSync(SESSIONS_FILE)) {
+            const raw = fs.readFileSync(SESSIONS_FILE, 'utf8');
+            const data = JSON.parse(raw);
+            const now = Date.now();
+            if (Array.isArray(data)) {
+                for (const item of data) {
+                    if (item && item.token && item.createdAt && (now - item.createdAt <= TOKEN_TTL_MS)) {
+                        validTokens.set(item.token, {
+                            createdAt: item.createdAt,
+                            ip: item.ip || 'unknown',
+                            lastActivity: item.lastActivity || item.createdAt
+                        });
+                    }
+                }
+            }
+            console.log(`[auth] Restored ${validTokens.size} active sessions from disk.`);
+        }
+    } catch (e) {
+        console.warn('[auth] Could not load saved sessions:', e.message);
+    }
+}
+
+function saveSessions() {
+    try {
+        const data = Array.from(validTokens.entries()).map(([token, meta]) => ({
+            token,
+            createdAt: meta.createdAt,
+            ip: meta.ip,
+            lastActivity: meta.lastActivity
+        }));
+        fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data), 'utf8');
+    } catch (_) {}
+}
+
+// Load existing sessions on boot
+loadSessions();
+
 // Periodic cleanup — runs every 10 minutes
 setInterval(() => {
     const now = Date.now();
+    let cleaned = false;
     for (const [token, v] of validTokens) {
-        if (now - v.createdAt > TOKEN_TTL_MS) validTokens.delete(token);
+        if (now - v.createdAt > TOKEN_TTL_MS) {
+            validTokens.delete(token);
+            cleaned = true;
+        }
     }
+    if (cleaned) saveSessions();
+
     for (const [ip, v] of loginAttempts) {
-        // Remove entries that have been unlocked for over an hour
         if (v.lockUntil < now - 3_600_000 && v.count < LOCKOUT_THRESHOLD) loginAttempts.delete(ip);
     }
     for (const [ip, v] of globalRateMap) {
@@ -152,6 +198,187 @@ const downloadsDir = path.join(__dirname, 'browser_data', 'downloads');
 fs.mkdirSync(downloadsDir, { recursive: true });
 app.use('/downloads', express.static(downloadsDir));
 
+// =============================================================================
+// THREAT INTELLIGENCE ENGINE
+// =============================================================================
+// Layers:
+//   1. Local public blocklist  — hourly refresh from ipsum/Firehol/abuse.ch feeds (no key needed)
+//   2. AbuseIPDB reputation    — per-login check + auto-report on lockout (free API key)
+//   3. Security audit log      — structured JSONL log written to browser_data/security.log
+// =============================================================================
+
+const ABUSEIPDB_KEY        = process.env.ABUSEIPDB_KEY || null;
+const ABUSEIPDB_BLOCK_SCORE = parseInt(process.env.ABUSEIPDB_BLOCK_SCORE || '80', 10);
+
+const securityLogPath = path.join(__dirname, 'browser_data', 'security.log');
+const abuseScoreCache = new Map(); // ip -> { score, fetchedAt }
+const SCORE_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
+// ---------- Public blocklist (downloaded from open threat feeds) ----------
+let publicBlocklist = new Set();
+let blocklistLastUpdated = null;
+
+const BLOCKLIST_FEEDS = [
+    // ipsum: aggregation of many public IP blocklists (score >= 3 attacks across lists)
+    'https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt',
+    // Emerging Threats known compromised hosts
+    'https://rules.emergingthreats.net/blockrules/compromised-ips.txt',
+    // abuse.ch Feodo tracker botnet C2 IPs
+    'https://feodotracker.abuse.ch/downloads/ipblocklist.txt',
+];
+
+async function refreshBlocklists() {
+    const newSet = new Set();
+    for (const feedUrl of BLOCKLIST_FEEDS) {
+        try {
+            const res = await fetch(feedUrl, { signal: AbortSignal.timeout(15_000) });
+            if (!res.ok) continue;
+            const text = await res.text();
+            for (const line of text.split('\n')) {
+                const trimmed = line.trim();
+                // Skip comment lines and blank lines
+                if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith(';')) continue;
+                // ipsum format: "1.2.3.4\t5" — take only the IP field
+                const ip = trimmed.split(/\s+/)[0];
+                if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+                    newSet.add(ip);
+                }
+            }
+        } catch (e) {
+            console.warn(`[blocklist] Failed to fetch ${feedUrl}: ${e.message}`);
+        }
+    }
+    publicBlocklist = newSet;
+    blocklistLastUpdated = new Date().toISOString();
+    console.log(`[blocklist] Refreshed: ${publicBlocklist.size} blocked IPs loaded from ${BLOCKLIST_FEEDS.length} feeds.`);
+}
+
+// Refresh on boot then every hour
+refreshBlocklists().catch(() => {});
+setInterval(() => refreshBlocklists().catch(() => {}), 60 * 60 * 1000);
+
+// ---------- Private / loopback IP guard ----------
+function isPrivateIp(ip) {
+    if (!ip || ip === '::1' || ip === '127.0.0.1') return true;
+    // Strip IPv6-mapped IPv4 prefix
+    const plain = ip.replace(/^::ffff:/, '');
+    return /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|0\.)/.test(plain);
+}
+
+// ---------- Security audit log writer ----------
+function securityLog(event) {
+    const entry = JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n';
+    fs.appendFile(securityLogPath, entry, () => {});
+    console.warn(`[security-log] ${JSON.stringify(event)}`);
+}
+
+// ---------- AbuseIPDB: check IP reputation ----------
+async function checkAbuseIPDB(ip) {
+    if (!ABUSEIPDB_KEY || isPrivateIp(ip)) return null;
+
+    // Return cached score if fresh
+    const cached = abuseScoreCache.get(ip);
+    if (cached && Date.now() - cached.fetchedAt < SCORE_CACHE_TTL) return cached;
+
+    try {
+        const cleanIp = ip.replace(/^::ffff:/, '');
+        const res = await fetch(
+            `https://api.abuseipdb.com/api/v2/check?ipAddress=${encodeURIComponent(cleanIp)}&maxAgeInDays=30&verbose`,
+            {
+                headers: { 'Key': ABUSEIPDB_KEY, 'Accept': 'application/json' },
+                signal: AbortSignal.timeout(5_000)
+            }
+        );
+        if (!res.ok) return null;
+        const json = await res.json();
+        const result = {
+            score: json.data?.abuseConfidenceScore ?? 0,
+            totalReports: json.data?.totalReports ?? 0,
+            countryCode: json.data?.countryCode ?? '??',
+            isp: json.data?.isp ?? 'Unknown',
+            fetchedAt: Date.now()
+        };
+        abuseScoreCache.set(ip, result);
+        return result;
+    } catch {
+        return null;
+    }
+}
+
+// ---------- AbuseIPDB: report an IP ----------
+async function reportToAbuseIPDB(ip, comment) {
+    if (!ABUSEIPDB_KEY || isPrivateIp(ip)) return;
+    try {
+        const cleanIp = ip.replace(/^::ffff:/, '');
+        const body = new URLSearchParams({
+            ip: cleanIp,
+            categories: '18',   // 18 = Brute-Force
+            comment: comment.slice(0, 1024)
+        });
+        const res = await fetch('https://api.abuseipdb.com/api/v2/report', {
+            method: 'POST',
+            headers: { 'Key': ABUSEIPDB_KEY, 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: body.toString(),
+            signal: AbortSignal.timeout(8_000)
+        });
+        if (res.ok) {
+            console.log(`[abuseipdb] Reported ${cleanIp} to AbuseIPDB.`);
+        }
+    } catch (e) {
+        console.warn(`[abuseipdb] Report failed for ${ip}: ${e.message}`);
+    }
+}
+
+// ---------- Composite threat check (blocklist + AbuseIPDB) ----------
+async function isThreatIp(ip) {
+    // Layer 1: instant local blocklist hit
+    const plain = ip.replace(/^::ffff:/, '');
+    if (publicBlocklist.has(plain)) {
+        return { blocked: true, reason: 'Public threat feed match', score: 100 };
+    }
+    // Layer 2: AbuseIPDB real-time score
+    const abuse = await checkAbuseIPDB(ip);
+    if (abuse && abuse.score >= ABUSEIPDB_BLOCK_SCORE) {
+        return { blocked: true, reason: `AbuseIPDB score ${abuse.score}/100`, score: abuse.score, isp: abuse.isp, country: abuse.countryCode };
+    }
+    return { blocked: false, score: abuse?.score ?? 0 };
+}
+
+// ---------- Security log admin endpoint ----------
+app.get('/api/security/log', (req, res) => {
+    // Only allow local access or authenticated session (check token in query)
+    const token = req.query.token;
+    if (!token || !validTokens.has(token)) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    try {
+        const raw = fs.readFileSync(securityLogPath, 'utf8');
+        const lines = raw.trim().split('\n').filter(Boolean);
+        // Return last 200 events
+        const entries = lines.slice(-200).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+        res.json({ count: entries.length, events: entries.reverse() });
+    } catch {
+        res.json({ count: 0, events: [] });
+    }
+});
+
+// Blocklist status endpoint
+app.get('/api/security/blocklist', (req, res) => {
+    const token = req.query.token;
+    if (!token || !validTokens.has(token)) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    res.json({
+        totalBlocked: publicBlocklist.size,
+        lastUpdated: blocklistLastUpdated,
+        feeds: BLOCKLIST_FEEDS,
+        abuseipdbEnabled: !!ABUSEIPDB_KEY,
+        blockScoreThreshold: ABUSEIPDB_BLOCK_SCORE
+    });
+});
+
+
+
 // --- CSRF origin validation helper ---
 function validateOrigin(req) {
     const origin = req.headers['origin'] || req.headers['referer'] || '';
@@ -167,12 +394,12 @@ function validateOrigin(req) {
 }
 
 // ---------- Login endpoint ----------
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
     const ip = getClientIp(req);
 
     // CSRF origin check — reject cross-origin POST requests
     if (!validateOrigin(req)) {
-        console.warn(`[security] Blocked cross-origin login attempt from ${ip}`);
+        securityLog({ event: 'csrf_block', ip });
         return res.status(403).json({ success: false, error: 'Forbidden' });
     }
 
@@ -183,13 +410,25 @@ app.post('/api/login', (req, res) => {
         return res.status(400).json({ success: false, error: 'Invalid request' });
     }
 
+    // ---- Layer 1: Public blocklist + AbuseIPDB threat check ----
+    // Run async, but don't let a slow API call block the response entirely
+    const threatCheck = await Promise.race([
+        isThreatIp(ip),
+        new Promise(resolve => setTimeout(() => resolve({ blocked: false, score: 0 }), 3000))
+    ]);
+
+    if (threatCheck.blocked) {
+        securityLog({ event: 'threat_ip_blocked', ip, reason: threatCheck.reason, score: threatCheck.score });
+        return res.status(403).json({ success: false, error: 'Access denied.' });
+    }
+
     // Check lockout state
     const attempt = loginAttempts.get(ip) || { count: 0, lockUntil: 0, firstAttempt: Date.now() };
     const now = Date.now();
 
     if (now < attempt.lockUntil) {
         const waitSec = Math.ceil((attempt.lockUntil - now) / 1000);
-        console.warn(`[security] Locked-out IP attempted login: ${ip} (${waitSec}s remaining)`);
+        securityLog({ event: 'lockout_blocked', ip, waitSec, count: attempt.count });
         return res.status(429)
             .set('Retry-After', String(waitSec))
             .json({ success: false, error: `Too many failed attempts. Try again in ${waitSec} seconds.` });
@@ -209,32 +448,38 @@ app.post('/api/login', (req, res) => {
             if (oldest) validTokens.delete(oldest[0]);
         }
 
-        // Issue a 256-bit cryptographically random token
         const token = crypto.randomBytes(32).toString('hex');
         validTokens.set(token, { createdAt: now, ip, lastActivity: now });
+        saveSessions();
 
-        console.log(`[auth] Successful login from ${ip}`);
+        securityLog({ event: 'login_success', ip, abuseScore: threatCheck.score });
         return res.json({ success: true, token });
     }
 
-    // Failed — apply exponential backoff lockout
+    // ---- Failed login — update lockout and potentially report ----
     attempt.count++;
-    if (attempt.count >= LOCKOUT_THRESHOLD) {
-        // Doubles with every failed attempt beyond the threshold (60s, 120s, 240s…)
+    const hitLockout = attempt.count >= LOCKOUT_THRESHOLD;
+
+    if (hitLockout) {
         const lockSeconds = 60 * Math.pow(2, attempt.count - LOCKOUT_THRESHOLD);
-        attempt.lockUntil = now + Math.min(lockSeconds * 1000, 24 * 60 * 60 * 1000); // cap at 24h
+        attempt.lockUntil = now + Math.min(lockSeconds * 1000, 24 * 60 * 60 * 1000);
+
+        // Report to AbuseIPDB asynchronously (do not block response)
+        reportToAbuseIPDB(
+            ip,
+            `Brute-force login attempt against a virtual browser application. ${attempt.count} failed attempts. Automatically reported.`
+        ).catch(() => {});
     }
 
-    // Cap attempts map size to resist memory DoS from unique IP floods
+    // Cap attempts map size
     if (loginAttempts.size > MAX_ATTEMPTS_STORED) {
         const oldest = [...loginAttempts.entries()].sort((a, b) => a[1].firstAttempt - b[1].firstAttempt)[0];
         if (oldest) loginAttempts.delete(oldest[0]);
     }
 
     loginAttempts.set(ip, attempt);
-    console.warn(`[security] Failed login from ${ip} (attempt ${attempt.count})`);
+    securityLog({ event: 'login_failed', ip, count: attempt.count, locked: hitLockout, abuseScore: threatCheck.score });
 
-    // Always return 401 with a generic error — do not reveal whether the user/password was wrong
     return res.status(401).json({ success: false, error: 'Incorrect password' });
 });
 
@@ -250,8 +495,7 @@ server.on('upgrade', (request, socket, head) => {
     const ip = getClientIp(request);
     const parsedUrl = url.parse(request.url, true);
 
-    // --- Token validation ---
-    // Accept token from query param OR Authorization header (header is preferred — not logged by proxies)
+    // Accept token from query param OR Authorization header
     let token = parsedUrl.query.token;
     const authHeader = request.headers['authorization'] || '';
     if (authHeader.startsWith('Bearer ')) {
@@ -259,29 +503,19 @@ server.on('upgrade', (request, socket, head) => {
     }
 
     const tokenData = token ? validTokens.get(token) : null;
-    const isValid   = !!tokenData;
+    const isValid   = !!tokenData && (Date.now() - tokenData.createdAt <= TOKEN_TTL_MS);
 
-    if (!isValid) {
-        console.warn(`[security] WS upgrade rejected — invalid or missing token from ${ip}`);
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-        return;
+    if (tokenData) {
+        if (!isValid) {
+            validTokens.delete(token);
+            saveSessions();
+        } else {
+            tokenData.lastActivity = Date.now();
+        }
     }
-
-    // Validate token hasn't expired
-    if (Date.now() - tokenData.createdAt > TOKEN_TTL_MS) {
-        validTokens.delete(token);
-        console.warn(`[security] WS upgrade rejected — expired token from ${ip}`);
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-        return;
-    }
-
-    // Update last activity timestamp
-    tokenData.lastActivity = Date.now();
 
     wss.handleUpgrade(request, socket, head, (ws) => {
-        ws.isAuthorized = true;
+        ws.isAuthorized = isValid;
         ws.clientIp = ip;
         ws.msgCount = 0;
         ws.msgWindowStart = Date.now();
@@ -594,35 +828,48 @@ async function closeTab(ws, tabId) {
     }
 }
 
-// ---------- Browser Lifecycle ----------
+async function launchBrowserInstance() {
+    const launchArgs = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-accelerated-2d-canvas',
+        '--enable-font-antialiasing',
+        '--font-render-hinting=medium',
+        '--subpixel-text-rendering',
+        '--force-color-profile=srgb'
+    ];
+
+    try {
+        console.log('[*] Launching Google Chrome channel (hardware/proprietary codec support)...');
+        return await chromium.launch({
+            headless: true,
+            channel: 'chrome',
+            args: launchArgs
+        });
+    } catch (err) {
+        console.warn('[!] Google Chrome channel unavailable, falling back to bundled Chromium:', err.message);
+        return await chromium.launch({
+            headless: true,
+            args: launchArgs
+        });
+    }
+}
+
 async function startBrowser() {
     if (browserReady || browserStarting) return;
     browserStarting = true;
 
     try {
-        console.log('[*] Launching Google Chrome + loading adblocker in parallel...');
+        console.log('[*] Initializing browser & adblocker...');
 
-        // Launch Chrome and load adblocker simultaneously
         const cacheDir = path.join(__dirname, 'adblocker_cache');
         fs.mkdirSync(cacheDir, { recursive: true });
         const cachePath = path.join(cacheDir, 'adblocker.bin');
 
         const [launchedBrowser, loadedAdblocker] = await Promise.all([
-            chromium.launch({
-                headless: true,
-                channel: 'chrome',
-                args: [
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--disable-accelerated-2d-canvas',
-                    '--enable-font-antialiasing',
-                    '--font-render-hinting=medium',
-                    '--subpixel-text-rendering',
-                    '--force-color-profile=srgb'
-                ]
-            }),
+            launchBrowserInstance(),
             PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch, {
                 path: cachePath,
                 read: async (p) => fs.promises.readFile(p),

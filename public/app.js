@@ -195,9 +195,33 @@ loginForm.addEventListener('submit', async (e) => {
 });
 
 // ---------- Main App ----------
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 3;
+
+function resetToLogin(errorMsg) {
+    sessionStorage.removeItem('vb_token');
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    reconnectAttempts = 0;
+    appInitialized = false;
+    if (ws) {
+        try { ws.close(); } catch (_) {}
+        ws = null;
+    }
+    hideOverlay();
+    appContainer.classList.add('hidden');
+    loginScreen.classList.remove('hidden');
+    if (errorMsg) {
+        loginError.textContent = errorMsg;
+        loginError.classList.remove('hidden');
+    }
+    loginBtn.disabled = false;
+    loginBtn.querySelector('span').textContent = 'Connect';
+}
+
 function initApp(token) {
     if (appInitialized) return;
     appInitialized = true;
+    reconnectAttempts = 0;
 
     connectWS(token);
 }
@@ -210,24 +234,32 @@ function connectWS(token) {
     ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
+        reconnectAttempts = 0;
         statusDot.classList.replace('disconnected', 'connected');
         statusText.textContent = 'Connected';
         viewportContainer.focus();
     };
 
     ws.onclose = (event) => {
-        // If the socket was closed due to auth failure, do not reconnect
-        if (event.code === 4001 || !sessionStorage.getItem('vb_token')) {
+        // If the socket was closed due to auth failure (code 4001 or 1008 or missing token)
+        if (event.code === 4001 || event.code === 1008 || !sessionStorage.getItem('vb_token')) {
+            resetToLogin('Session expired or unauthorized. Please log in again.');
+            return;
+        }
+
+        reconnectAttempts++;
+        if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+            resetToLogin('Unable to connect to server. Please log in again.');
             return;
         }
 
         statusDot.classList.replace('connected', 'disconnected');
-        statusText.textContent = 'Reconnecting...';
-        showOverlay('Reconnecting...');
+        statusText.textContent = `Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`;
+        showOverlay(`Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
         viewportContainer.classList.remove('ready');
 
-        // Retry immediately with the same token — no login screen flash
-        reconnectTimer = setTimeout(() => connectWS(token), 3000);
+        // Retry with brief delay
+        reconnectTimer = setTimeout(() => connectWS(token), 2000);
     };
 
     ws.onerror = () => {
@@ -315,12 +347,7 @@ function connectWS(token) {
                 break;
 
             case 'auth_error':
-                sessionStorage.removeItem('vb_token');
-                loginScreen.classList.remove('hidden');
-                appContainer.classList.add('hidden');
-                loginError.textContent = msg.error || 'Session expired';
-                loginError.classList.remove('hidden');
-                ws.close();
+                resetToLogin(msg.error || 'Session expired. Please log in again.');
                 break;
 
             case 'loading_state':
