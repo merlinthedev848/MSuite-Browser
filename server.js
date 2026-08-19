@@ -802,6 +802,15 @@ async function switchTab(ws, tabId) {
     ws.send(JSON.stringify({ type: 'url_changed', url: t.url }));
 
     await startScreencast(t.client, ws);
+
+    // Immediate initial frame dispatch: paints the viewport instantly without waiting for network/DOM mutations
+    t.page.screenshot({ type: 'jpeg', quality: ws.streamQuality || 85 })
+        .then(buf => {
+            if (ws.activeTabId === tabId && ws.readyState === WebSocket.OPEN) {
+                sendFrameToClient(ws, buf.toString('base64'));
+            }
+        })
+        .catch(() => {});
 }
 
 async function closeTab(ws, tabId) {
@@ -970,37 +979,43 @@ async function initBrowserContext(ws) {
         ws.context = await browser.newContext(contextOptions);
     }
 
-    await ws.context.exposeBinding('__reportCursor', (source, cursor) => {
-        if (source.page.isClosed()) return;
-        const tab = Array.from(ws.tabs.values()).find(t => t.page === source.page);
-        if (tab && ws.activeTabId && ws.tabs.get(ws.activeTabId) === tab) {
-            ws.send(JSON.stringify({ type: 'cursor', cursor }));
-        }
-    });
+    try {
+        await ws.context.exposeBinding('__reportCursor', (source, cursor) => {
+            if (source.page.isClosed()) return;
+            const tab = Array.from(ws.tabs.values()).find(t => t.page === source.page);
+            if (tab && ws.activeTabId && ws.tabs.get(ws.activeTabId) === tab) {
+                ws.send(JSON.stringify({ type: 'cursor', cursor }));
+            }
+        });
+    } catch (_) {}
 
-    await ws.context.exposeBinding('__reportCopy', (source, text) => {
-        if (source.page.isClosed()) return;
-        ws.send(JSON.stringify({ type: 'clipboard', text }));
-    });
+    try {
+        await ws.context.exposeBinding('__reportCopy', (source, text) => {
+            if (source.page.isClosed()) return;
+            ws.send(JSON.stringify({ type: 'clipboard', text }));
+        });
+    } catch (_) {}
 
-    const targetUA = ws.currentUserAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
-    await ws.context.addInitScript((ua) => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        window.__customUA = ua;
+    try {
+        const targetUA = ws.currentUserAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+        await ws.context.addInitScript((ua) => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.__customUA = ua;
 
-        document.addEventListener('mouseover', (e) => {
-            try {
-                window.__reportCursor(window.getComputedStyle(e.target).cursor);
-            } catch (_) {}
-        }, { passive: true, capture: true });
+            document.addEventListener('mouseover', (e) => {
+                try {
+                    window.__reportCursor(window.getComputedStyle(e.target).cursor);
+                } catch (_) {}
+            }, { passive: true, capture: true });
 
-        document.addEventListener('copy', () => {
-            try {
-                const selected = window.getSelection().toString();
-                if (selected) window.__reportCopy(selected);
-            } catch (_) {}
-        }, { passive: true, capture: true });
-    }, targetUA);
+            document.addEventListener('copy', () => {
+                try {
+                    const selected = window.getSelection().toString();
+                    if (selected) window.__reportCopy(selected);
+                } catch (_) {}
+            }, { passive: true, capture: true });
+        }, targetUA);
+    } catch (_) {}
 }
 
 // ---------- WebSocket Connection Handler ----------
