@@ -96,6 +96,34 @@
                 <span class="status-dot disconnected" aria-hidden="true"></span>
                 <span class="status-text">Disconnected</span>
             </div>
+            <!-- Find in page -->
+            <button id="find-btn" class="toolbar-btn" title="Find in Page (Ctrl+F)" aria-label="Find in page">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                </svg>
+            </button>
+            <!-- Downloads -->
+            <button id="downloads-btn" class="toolbar-btn" title="Downloads" aria-label="Open downloads panel">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+            </button>
+            <!-- Mute -->
+            <button id="mute-btn" class="toolbar-btn" title="Mute Tab" aria-label="Mute remote audio">
+                <svg id="mute-icon-on" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                </svg>
+                <svg id="mute-icon-off" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                    <line x1="23" y1="9" x2="17" y2="15"></line>
+                    <line x1="17" y1="9" x2="23" y2="15"></line>
+                </svg>
+            </button>
             <button id="clip-btn" class="toolbar-btn" title="Clipboard Sync" aria-label="View synced clipboard">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
@@ -154,29 +182,33 @@
             </div>
         </div>
 
-        <!-- Settings Modal -->
         <div id="settings-modal" class="settings-modal hidden" role="dialog" aria-labelledby="settings-modal-title">
             <div class="settings-modal-header">
-                <h3 id="settings-modal-title">Session Settings</h3>
+                <h3 id="settings-modal-title">⚙️ Session Settings</h3>
                 <button id="settings-close-btn" aria-label="Close settings panel">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                 </button>
             </div>
             <div class="settings-body">
+                <p class="settings-section-label">Privacy & Security</p>
                 <div class="settings-group">
                     <label class="toggle-control">
-                        <span>Enable Adblocker</span>
+                        <span>🛡️ Adblocker</span>
                         <input type="checkbox" id="adblock-toggle" checked />
                         <span class="control-indicator"></span>
                     </label>
                 </div>
-                <div class="settings-group">
-                    <label class="toggle-control">
-                        <span>VPN (Tor Onion Proxy)</span>
-                        <input type="checkbox" id="vpn-toggle" />
-                        <span class="control-indicator"></span>
-                    </label>
+                <div class="settings-group proxy-group">
+                    <label for="proxy-input">🌐 Proxy Server <span class="label-hint">(socks5:// or http://)</span></label>
+                    <div class="proxy-row">
+                        <input type="text" id="proxy-input" placeholder="socks5://user:pass@host:port" autocomplete="off" spellcheck="false" />
+                        <button id="proxy-apply-btn" class="btn-small">Apply</button>
+                        <button id="proxy-clear-btn" class="btn-small btn-outline">Off</button>
+                    </div>
+                    <p class="settings-hint">🔒 Routes ALL browser traffic through your own secure proxy. Supports SOCKS5, SOCKS4, HTTP.</p>
                 </div>
+
+                <p class="settings-section-label">User-Agent & Display</p>
                 <div class="settings-group">
                     <label for="ua-select">User-Agent Profile</label>
                     <select id="ua-select">
@@ -187,6 +219,15 @@
                     <input type="text" id="custom-ua-input" class="hidden" placeholder="Enter custom User-Agent..." autocomplete="off" spellcheck="false" />
                 </div>
                 <div class="settings-group">
+                    <label>Page Zoom</label>
+                    <div class="zoom-row">
+                        <button id="zoom-out-btn" class="btn-small btn-outline">−</button>
+                        <span id="zoom-level-display">100%</span>
+                        <button id="zoom-in-btn" class="btn-small btn-outline">+</button>
+                        <button id="zoom-reset-btn" class="btn-small btn-outline">Reset</button>
+                    </div>
+                </div>
+                <div class="settings-group">
                     <label for="quality-select">Stream Performance</label>
                     <select id="quality-select">
                         <option value="jpeg_90" selected>Fast - Balanced (JPEG 90)</option>
@@ -194,11 +235,53 @@
                         <option value="png">Lossless - Pixel-Perfect (PNG)</option>
                     </select>
                 </div>
+
+                <p class="settings-section-label">Session</p>
                 <div class="settings-group actions">
-                    <button id="clear-session-btn" class="btn-danger">Clear Cookies & Cache</button>
+                    <button id="clear-session-btn" class="btn-danger">🗑️ Clear Cookies &amp; Cache</button>
                 </div>
             </div>
         </div>
+
+        <!-- Downloads Panel -->
+        <div id="downloads-panel" class="downloads-panel hidden" role="dialog" aria-label="Downloads">
+            <div class="downloads-header">
+                <span>📥 Downloads</span>
+                <button id="downloads-close-btn">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+            </div>
+            <div id="downloads-list" class="downloads-list">
+                <p class="downloads-empty">No downloads yet.</p>
+            </div>
+        </div>
+
+        <!-- File Upload Panel -->
+        <div id="upload-panel" class="upload-panel hidden" role="dialog" aria-label="Upload a file">
+            <div class="upload-header">
+                <span>📤 Upload File</span>
+                <button id="upload-close-btn">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+            </div>
+            <p class="upload-hint">The remote page is requesting a file. Select one from your device:</p>
+            <input type="file" id="local-file-input" style="display:none" />
+            <button id="upload-pick-btn" class="btn-small">Choose File...</button>
+            <span id="upload-filename" class="upload-filename">No file chosen</span>
+            <div class="upload-actions">
+                <button id="upload-send-btn" class="btn-small" disabled>Send to Browser</button>
+                <button id="upload-cancel-btn" class="btn-small btn-outline">Cancel</button>
+            </div>
+        </div>
+
+        <!-- Find In Page Bar -->
+        <div id="find-bar" class="find-bar hidden">
+            <input type="text" id="find-input" placeholder="Find in page..." autocomplete="off" spellcheck="false" />
+            <span id="find-count" class="find-count"></span>
+            <button id="find-prev-btn" class="find-btn" title="Previous">▲</button>
+            <button id="find-next-btn" class="find-btn" title="Next">▼</button>
+            <button id="find-close-btn" class="find-btn" title="Close">✕</button>
+        </div></div>
 
         <!-- Custom Context Menu -->
         <div id="context-menu" class="context-menu hidden" role="menu">

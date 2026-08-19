@@ -42,6 +42,11 @@ app.use((req, res, next) => {
 
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Expose browser downloads folder publicly to allow users to download files locally
+const downloadsDir = path.join(__dirname, 'browser_data', 'downloads');
+fs.mkdirSync(downloadsDir, { recursive: true });
+app.use('/downloads', express.static(downloadsDir));
+
 app.post('/api/login', (req, res) => {
     const { password } = req.body || {};
     const ip = getClientIp(req);
@@ -270,6 +275,39 @@ async function createTab(ws) {
         if (tabId === ws.activeTabId && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'loading_state', loading: false }));
         }
+        if (ws.zoomFactor) {
+            page.evaluate((zoom) => {
+                document.body.style.zoom = zoom;
+            }, ws.zoomFactor).catch(() => {});
+        }
+    });
+
+    // Intercept remote browser downloads
+    page.on('download', async (download) => {
+        try {
+            const filename = download.suggestedFilename();
+            const savePath = path.join(downloadsDir, filename);
+            await download.saveAs(savePath);
+            console.log(`[download] File downloaded: ${filename} to ${savePath}`);
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'download_ready',
+                    filename,
+                    url: `/downloads/${encodeURIComponent(filename)}`
+                }));
+            }
+        } catch (err) {
+            console.error('[download] Failed to process download:', err.message);
+        }
+    });
+
+    // Intercept file chooser dialog
+    page.on('filechooser', async (fileChooser) => {
+        console.log('[ws] Remote site requested file upload');
+        ws.activeFileChooser = fileChooser;
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'file_chooser_open' }));
+        }
     });
     page.on('load', () => {
         if (tabId === ws.activeTabId && ws.readyState === WebSocket.OPEN) {
@@ -442,7 +480,8 @@ async function initBrowserContext(ws) {
         deviceScaleFactor: 1,
         userAgent: ws.currentUserAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
         locale: 'en-US',
-        timezoneId: 'Europe/London'
+        timezoneId: 'Europe/London',
+        acceptDownloads: true
     };
 
     if (ws.vpnEnabled) {
@@ -450,6 +489,9 @@ async function initBrowserContext(ws) {
             server: 'socks5://127.0.0.1:9050'
         };
         console.log('[vpn] Proxying browser context via socks5://127.0.0.1:9050 (Tor)');
+    } else if (ws.proxyServer) {
+        contextOptions.proxy = { server: ws.proxyServer };
+        console.log(`[proxy] Proxying browser context via: ${ws.proxyServer}`);
     }
 
     ws.context = await browser.newContext(contextOptions);
@@ -577,6 +619,19 @@ wss.on('connection', async (ws) => {
                 if (msg.quality !== undefined && typeof msg.quality !== 'number') return;
             } else if (msg.type === 'toggle_vpn') {
                 if (typeof msg.enabled !== 'boolean') return;
+            } else if (msg.type === 'set_zoom') {
+                if (typeof msg.zoom !== 'number' || msg.zoom < 0.2 || msg.zoom > 5.0) return;
+            } else if (msg.type === 'file_uploaded') {
+                if (typeof msg.name !== 'string' || msg.name.length > 255) return;
+                if (typeof msg.data !== 'string' || msg.data.length > 200_000_000) return;
+            } else if (msg.type === 'set_proxy') {
+                if (typeof msg.proxy !== 'string' || msg.proxy.length > 512) return;
+            } else if (msg.type === 'set_mute') {
+                if (typeof msg.muted !== 'boolean') return;
+            } else if (msg.type === 'find') {
+                if (typeof msg.query !== 'string' || msg.query.length > 512) return;
+            } else if (msg.type === 'find_next') {
+                if (typeof msg.forward !== 'boolean') return;
             }
         } catch {
             return;
@@ -682,9 +737,103 @@ wss.on('connection', async (ws) => {
                 return;
             }
 
+            if (msg.type === 'set_zoom') {
+                ws.zoomFactor = msg.zoom;
+                if (ws.activeTabId && ws.tabs.has(ws.activeTabId)) {
+                    const page = ws.tabs.get(ws.activeTabId).page;
+                    await page.evaluate((zoom) => {
+                        document.body.style.zoom = zoom;
+                    }, msg.zoom).catch(() => {});
+                }
+                console.log(`[session] Zoom set to: ${msg.zoom * 100}%`);
+                return;
+            }
+
+            if (msg.type === 'file_uploaded') {
+                if (ws.activeFileChooser) {
+                    try {
+                        const buffer = Buffer.from(msg.data, 'base64');
+                        const tempPath = path.join(downloadsDir, 'upload_' + Date.now() + '_' + msg.name);
+                        await fs.promises.writeFile(tempPath, buffer);
+                        console.log(`[upload] Saved local upload to temp file: ${tempPath}`);
+                        await ws.activeFileChooser.setFiles(tempPath);
+                        // Clean up the temp file after Playwright consumes it
+                        setTimeout(async () => {
+                            await fs.promises.unlink(tempPath).catch(() => {});
+                        }, 5000);
+                        ws.activeFileChooser = null;
+                    } catch (err) {
+                        console.error('[upload] Failed to process upload:', err.message);
+                    }
+                } else {
+                    console.warn('[upload] Received upload data but no active file chooser was open');
+                }
+                return;
+            }
+
             if (!ws.activeTabId || !ws.tabs.has(ws.activeTabId)) return;
             const p = ws.tabs.get(ws.activeTabId).page;
             if (p.isClosed()) return;
+
+            // -- Proxy reconfiguration (fast, no Tor - instant context swap) --
+            if (msg.type === 'set_proxy') {
+                ws.proxyServer = msg.proxy || null;
+                ws.vpnEnabled = false; // proxy replaces vpn
+                try {
+                    const currentUrl = p.url();
+                    await initBrowserContext(ws);
+                    const tabId = await createTab(ws);
+                    await switchTab(ws, tabId);
+                    if (currentUrl && currentUrl !== 'about:blank') {
+                        ws.tabs.get(tabId).page.goto(currentUrl).catch(() => {});
+                    }
+                } catch (err) {
+                    console.error('[!] Failed to apply proxy:', err.message);
+                }
+                return;
+            }
+
+            // -- Mute / Unmute via CDP --
+            if (msg.type === 'set_mute') {
+                const tab = ws.tabs.get(ws.activeTabId);
+                if (tab && tab.client) {
+                    await tab.client.send('Emulation.setMediaOverridesEnabled', {
+                        media: msg.muted ? 'screen' : 'screen'
+                    }).catch(() => {});
+                    // Best-effort mute via page evaluate
+                    await p.evaluate((muted) => {
+                        document.querySelectorAll('video, audio').forEach(el => { el.muted = muted; });
+                    }, msg.muted).catch(() => {});
+                }
+                return;
+            }
+
+            // -- Find in page --
+            if (msg.type === 'find') {
+                const tab = ws.tabs.get(ws.activeTabId);
+                if (tab && tab.client) {
+                    if (msg.query) {
+                        const result = await tab.client.send('Page.findText', {
+                            text: msg.query, caseSensitive: false, searchInUserValue: false
+                        }).catch(() => null);
+                        if (result && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ type: 'find_result', count: result.matchCount || 0 }));
+                        }
+                    } else {
+                        await tab.client.send('Page.stopFinding', { action: 'clearSelection' }).catch(() => {});
+                    }
+                }
+                return;
+            }
+
+            if (msg.type === 'find_next') {
+                const tab = ws.tabs.get(ws.activeTabId);
+                if (tab && tab.client) {
+                    await tab.client.send('Page.findNext', { forward: msg.forward }).catch(() => {});
+                }
+                return;
+            }
+
 
             switch (msg.type) {
                 case 'mousemove':

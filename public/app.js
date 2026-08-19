@@ -30,25 +30,49 @@ const settingsBtn       = document.getElementById('settings-btn');
 const settingsModal     = document.getElementById('settings-modal');
 const settingsCloseBtn  = document.getElementById('settings-close-btn');
 const adblockToggle     = document.getElementById('adblock-toggle');
-const vpnToggle         = document.getElementById('vpn-toggle');
 const uaSelect          = document.getElementById('ua-select');
 const customUaInput     = document.getElementById('custom-ua-input');
 const clearSessionBtn   = document.getElementById('clear-session-btn');
 
-const bookmarksBar      = document.getElementById('bookmarks-bar');
-const bookmarksContainer = document.getElementById('bookmarks-container');
-const addBookmarkBtn    = document.getElementById('add-bookmark-btn');
+// Proxy controls
+const proxyInput        = document.getElementById('proxy-input');
+const proxyApplyBtn     = document.getElementById('proxy-apply-btn');
+const proxyClearBtn     = document.getElementById('proxy-clear-btn');
 
-const loadingProgress   = document.getElementById('loading-progress');
-const qualitySelect     = document.getElementById('quality-select');
+// Zoom controls
+const zoomInBtn         = document.getElementById('zoom-in-btn');
+const zoomOutBtn        = document.getElementById('zoom-out-btn');
+const zoomResetBtn      = document.getElementById('zoom-reset-btn');
+const zoomDisplay       = document.getElementById('zoom-level-display');
 
-const contextMenu       = document.getElementById('context-menu');
-const ctxBack           = document.getElementById('ctx-back');
-const ctxForward        = document.getElementById('ctx-forward');
-const ctxReload         = document.getElementById('ctx-reload');
-const ctxNewTab         = document.getElementById('ctx-newtab');
-const ctxAdblock        = document.getElementById('ctx-adblock');
-const ctxClear          = document.getElementById('ctx-clear');
+// Toolbar new buttons
+const findBtn           = document.getElementById('find-btn');
+const downloadsBtn      = document.getElementById('downloads-btn');
+const muteBtn           = document.getElementById('mute-btn');
+const muteIconOn        = document.getElementById('mute-icon-on');
+const muteIconOff       = document.getElementById('mute-icon-off');
+
+// Downloads panel
+const downloadsPanel    = document.getElementById('downloads-panel');
+const downloadsCloseBtn = document.getElementById('downloads-close-btn');
+const downloadsList     = document.getElementById('downloads-list');
+
+// Upload panel
+const uploadPanel       = document.getElementById('upload-panel');
+const uploadCloseBtn    = document.getElementById('upload-close-btn');
+const uploadPickBtn     = document.getElementById('upload-pick-btn');
+const localFileInput    = document.getElementById('local-file-input');
+const uploadFilename    = document.getElementById('upload-filename');
+const uploadSendBtn     = document.getElementById('upload-send-btn');
+const uploadCancelBtn   = document.getElementById('upload-cancel-btn');
+
+// Find bar
+const findBar           = document.getElementById('find-bar');
+const findInput         = document.getElementById('find-input');
+const findCount         = document.getElementById('find-count');
+const findPrevBtn       = document.getElementById('find-prev-btn');
+const findNextBtn       = document.getElementById('find-next-btn');
+const findCloseBtn      = document.getElementById('find-close-btn');
 
 // ---------- State ----------
 let ws = null;
@@ -56,6 +80,9 @@ let appInitialized = false;
 let reconnectTimer = null;
 let activeTabId = null;
 let loadingTimer = null;
+let zoomLevel = 1.0;
+let isMuted = false;
+let pendingUploadFile = null;
 
 // Double buffer variables for flicker-free streaming
 let activeImg = imgA;
@@ -235,6 +262,19 @@ function connectWS(token) {
 
             case 'loading_state':
                 handleLoadingState(msg.loading);
+                break;
+
+            case 'download_ready':
+                addDownloadItem(msg.filename, msg.url);
+                downloadsPanel.classList.remove('hidden');
+                break;
+
+            case 'file_chooser_open':
+                uploadPanel.classList.remove('hidden');
+                break;
+
+            case 'find_result':
+                findCount.textContent = msg.count > 0 ? `${msg.count} match${msg.count > 1 ? 'es' : ''}` : 'No matches';
                 break;
         }
     };
@@ -451,6 +491,13 @@ window.addEventListener('keydown', (e) => {
         sendMsg({ type: 'new_tab' });
         return;
     }
+    if (isCmdOrCtrl && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        findBar.classList.remove('hidden');
+        findInput.focus();
+        findInput.select();
+        return;
+    }
     if (isCmdOrCtrl && e.key.toLowerCase() === 'w') {
         e.preventDefault();
         if (activeTabId) {
@@ -550,10 +597,141 @@ adblockToggle.addEventListener('change', () => {
     sendMsg({ type: 'toggle_adblocker', enabled: adblockToggle.checked });
 });
 
-vpnToggle.addEventListener('change', () => {
-    sendMsg({ type: 'toggle_vpn', enabled: vpnToggle.checked });
-    showOverlay('Re-routing context through Tor...');
+// ---------- Proxy Settings ----------
+proxyApplyBtn.addEventListener('click', () => {
+    const proxy = proxyInput.value.trim();
+    if (!proxy) return;
+    sendMsg({ type: 'set_proxy', proxy });
+    showOverlay('Applying proxy & restarting context...');
     settingsModal.classList.add('hidden');
+});
+
+proxyClearBtn.addEventListener('click', () => {
+    proxyInput.value = '';
+    sendMsg({ type: 'set_proxy', proxy: '' });
+    showOverlay('Clearing proxy & restarting context...');
+    settingsModal.classList.add('hidden');
+});
+
+proxyInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') proxyApplyBtn.click();
+});
+
+// ---------- Zoom Controls ----------
+function applyZoom(level) {
+    zoomLevel = Math.min(5.0, Math.max(0.2, level));
+    zoomDisplay.textContent = Math.round(zoomLevel * 100) + '%';
+    sendMsg({ type: 'set_zoom', zoom: zoomLevel });
+}
+
+zoomInBtn.addEventListener('click', () => applyZoom(zoomLevel + 0.1));
+zoomOutBtn.addEventListener('click', () => applyZoom(zoomLevel - 0.1));
+zoomResetBtn.addEventListener('click', () => applyZoom(1.0));
+
+// ---------- Mute Toggle ----------
+muteBtn.addEventListener('click', () => {
+    isMuted = !isMuted;
+    sendMsg({ type: 'set_mute', muted: isMuted });
+    muteIconOn.style.display = isMuted ? 'none' : '';
+    muteIconOff.style.display = isMuted ? '' : 'none';
+    muteBtn.title = isMuted ? 'Unmute Tab' : 'Mute Tab';
+});
+
+// ---------- Find In Page ----------
+findBtn.addEventListener('click', () => {
+    findBar.classList.toggle('hidden');
+    if (!findBar.classList.contains('hidden')) {
+        findInput.focus();
+        findInput.select();
+    } else {
+        sendMsg({ type: 'find', query: '' });
+        findCount.textContent = '';
+    }
+});
+
+findCloseBtn.addEventListener('click', () => {
+    findBar.classList.add('hidden');
+    sendMsg({ type: 'find', query: '' });
+    findCount.textContent = '';
+});
+
+let findDebounce = null;
+findInput.addEventListener('input', () => {
+    clearTimeout(findDebounce);
+    findDebounce = setTimeout(() => {
+        sendMsg({ type: 'find', query: findInput.value });
+    }, 250);
+});
+
+findInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        sendMsg({ type: 'find_next', forward: !e.shiftKey });
+    } else if (e.key === 'Escape') {
+        findCloseBtn.click();
+    }
+});
+
+findNextBtn.addEventListener('click', () => sendMsg({ type: 'find_next', forward: true }));
+findPrevBtn.addEventListener('click', () => sendMsg({ type: 'find_next', forward: false }));
+
+// ---------- Downloads Panel ----------
+downloadsBtn.addEventListener('click', () => {
+    downloadsPanel.classList.toggle('hidden');
+});
+
+downloadsCloseBtn.addEventListener('click', () => {
+    downloadsPanel.classList.add('hidden');
+});
+
+function addDownloadItem(filename, url) {
+    const empty = downloadsList.querySelector('.downloads-empty');
+    if (empty) empty.remove();
+
+    const item = document.createElement('div');
+    item.className = 'download-item';
+    item.innerHTML = `
+        <span class="download-item-name" title="${filename}">📄 ${filename}</span>
+        <a class="download-item-link" href="${url}" download="${filename}" target="_blank">Save ↓</a>
+    `;
+    downloadsList.prepend(item);
+}
+
+// ---------- File Upload Panel ----------
+uploadPickBtn.addEventListener('click', () => localFileInput.click());
+
+localFileInput.addEventListener('change', () => {
+    const file = localFileInput.files[0];
+    if (!file) return;
+    pendingUploadFile = file;
+    uploadFilename.textContent = file.name;
+    uploadSendBtn.disabled = false;
+});
+
+uploadSendBtn.addEventListener('click', () => {
+    if (!pendingUploadFile) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        const base64 = e.target.result.split(',')[1];
+        sendMsg({ type: 'file_uploaded', name: pendingUploadFile.name, data: base64 });
+        uploadPanel.classList.add('hidden');
+        pendingUploadFile = null;
+        localFileInput.value = '';
+        uploadFilename.textContent = 'No file chosen';
+        uploadSendBtn.disabled = true;
+    };
+    reader.readAsDataURL(pendingUploadFile);
+});
+
+uploadCancelBtn.addEventListener('click', () => {
+    uploadPanel.classList.add('hidden');
+    pendingUploadFile = null;
+    localFileInput.value = '';
+    uploadFilename.textContent = 'No file chosen';
+    uploadSendBtn.disabled = true;
+});
+
+uploadCloseBtn.addEventListener('click', () => {
+    uploadPanel.classList.add('hidden');
 });
 
 uaSelect.addEventListener('change', () => {
@@ -587,6 +765,7 @@ clearSessionBtn.addEventListener('click', () => {
         settingsModal.classList.add('hidden');
     }
 });
+
 
 // ---------- Bookmarks Bar ----------
 const DEFAULT_BOOKMARKS = [
