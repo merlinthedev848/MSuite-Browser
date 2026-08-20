@@ -801,11 +801,29 @@ async function switchTab(ws, tabId) {
     ws.activeTabId = tabId;
     const t = ws.tabs.get(tabId);
 
+    if (ws.ackTimeout) {
+        clearTimeout(ws.ackTimeout);
+        ws.ackTimeout = null;
+    }
     ws.frameInFlight = false;
     ws.lastFrameData = null;
 
     sendTabState(ws);
     ws.send(JSON.stringify({ type: 'url_changed', url: t.url }));
+
+    // Apply active zoom factor to newly switched tab
+    if (ws.zoomFactor && !t.page.isClosed()) {
+        t.page.evaluate((zoom) => {
+            if (document.body) document.body.style.zoom = zoom;
+        }, ws.zoomFactor).catch(() => {});
+    }
+
+    // Apply active mute state to newly switched tab
+    if (ws.isMuted && !t.page.isClosed()) {
+        t.page.evaluate((muted) => {
+            document.querySelectorAll('video, audio').forEach(el => { el.muted = muted; });
+        }, true).catch(() => {});
+    }
 
     await startScreencast(t.client, ws);
 
@@ -911,7 +929,7 @@ async function startBrowser() {
 }
 
 // Pre-warmed context pool — keeps one idle context ready to hand off on connection
-let contextPool = null; // { context, page } | null
+let contextPool = null; // BrowserContext | null
 
 async function prewarmContextPool() {
     if (contextPool || !browserReady) return;
@@ -924,9 +942,7 @@ async function prewarmContextPool() {
             timezoneId: 'Europe/London',
             acceptDownloads: true
         });
-        // Open a blank page so Chromium has a renderer process ready
-        const page = await ctx.newPage();
-        contextPool = { context: ctx, page };
+        contextPool = ctx;
         console.log('[pool] Pre-warmed context ready.');
     } catch (e) {
         console.warn('[pool] Pre-warm failed:', e.message);
@@ -956,9 +972,7 @@ async function initBrowserContext(ws) {
     // Claim the pre-warmed pooled context if available and no proxy is needed
     if (!needsProxy && contextPool) {
         console.log('[pool] Handing off pre-warmed context to new session (instant).');
-        ws.context = contextPool.context;
-        // Close the placeholder blank page — createTab will open a real one
-        contextPool.page.close().catch(() => {});
+        ws.context = contextPool;
         contextPool = null;
         // Immediately start warming the next context for the next connection
         prewarmContextPool().catch(e => console.warn('[pool] Re-warm failed:', e.message));
