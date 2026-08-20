@@ -98,6 +98,8 @@ const ctxClear          = document.getElementById('ctx-clear');
 // ---------- State ----------
 let ws = null;
 let appInitialized = false;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 3;
 let reconnectTimer = null;
 let activeTabId = null;
 let loadingTimer = null;
@@ -112,14 +114,6 @@ let bufferImg = imgB;
 // Remote browser resolution — must match server.js viewport
 const REMOTE_W = 1920;
 const REMOTE_H = 1080;
-
-// ---------- Session Persistence ----------
-const storedToken = sessionStorage.getItem('vb_token');
-if (storedToken) {
-    loginScreen.classList.add('hidden');
-    appContainer.classList.remove('hidden');
-    initApp(storedToken);
-}
 
 // ---------- Login ----------
 let loginThrottleUntil = 0;
@@ -215,9 +209,6 @@ loginForm.addEventListener('submit', async (e) => {
 });
 
 // ---------- Main App ----------
-let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 3;
-
 function resetToLogin(errorMsg) {
     sessionStorage.removeItem('vb_token');
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
@@ -1076,4 +1067,12 @@ if (winClose) {
             passwordInput.value = '';
         }
     });
+}
+
+// ---------- Bootstrap Stored Session ----------
+const storedToken = sessionStorage.getItem('vb_token');
+if (storedToken) {
+    loginScreen.classList.add('hidden');
+    appContainer.classList.remove('hidden');
+    initApp(storedToken);
 }
