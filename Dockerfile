@@ -27,6 +27,7 @@ RUN curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
 RUN npx playwright install chrome --with-deps
 
 COPY . .
+RUN sed -i 's/\r$//' /usr/src/app/entrypoint.sh && chmod +x /usr/src/app/entrypoint.sh
 
 EXPOSE 3000
 

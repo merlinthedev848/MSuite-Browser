@@ -75,6 +75,26 @@ const findPrevBtn       = document.getElementById('find-prev-btn');
 const findNextBtn       = document.getElementById('find-next-btn');
 const findCloseBtn      = document.getElementById('find-close-btn');
 
+// Progress bar
+const loadingProgress   = document.getElementById('loading-progress');
+
+// Bookmarks bar
+const bookmarksBar      = document.getElementById('bookmarks-bar');
+const bookmarksContainer = document.getElementById('bookmarks-container');
+const addBookmarkBtn    = document.getElementById('add-bookmark-btn');
+
+// Quality selector
+const qualitySelect     = document.getElementById('quality-select');
+
+// Context menu
+const contextMenu       = document.getElementById('context-menu');
+const ctxBack           = document.getElementById('ctx-back');
+const ctxForward        = document.getElementById('ctx-forward');
+const ctxReload         = document.getElementById('ctx-reload');
+const ctxNewTab         = document.getElementById('ctx-newtab');
+const ctxAdblock        = document.getElementById('ctx-adblock');
+const ctxClear          = document.getElementById('ctx-clear');
+
 // ---------- State ----------
 let ws = null;
 let appInitialized = false;

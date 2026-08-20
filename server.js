@@ -193,10 +193,16 @@ app.use(express.static(path.join(__dirname, 'public'), {
     }
 }));
 
-// Expose browser downloads folder
+// Expose browser downloads folder with restricted headers
 const downloadsDir = path.join(__dirname, 'browser_data', 'downloads');
 fs.mkdirSync(downloadsDir, { recursive: true });
-app.use('/downloads', express.static(downloadsDir));
+app.use('/downloads', express.static(downloadsDir, {
+    dotfiles: 'deny',
+    setHeaders: (res) => {
+        res.setHeader('Content-Disposition', 'attachment');
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+    }
+}));
 
 // =============================================================================
 // THREAT INTELLIGENCE ENGINE
@@ -1259,8 +1265,9 @@ wss.on('connection', async (ws) => {
             if (msg.type === 'file_uploaded') {
                 if (ws.activeFileChooser) {
                     try {
+                        const safeName = path.basename(msg.name).replace(/[^a-zA-Z0-9._-]/g, '_');
                         const buffer = Buffer.from(msg.data, 'base64');
-                        const tempPath = path.join(downloadsDir, 'upload_' + Date.now() + '_' + msg.name);
+                        const tempPath = path.join(downloadsDir, 'upload_' + Date.now() + '_' + safeName);
                         await fs.promises.writeFile(tempPath, buffer);
                         console.log(`[upload] Saved local upload to temp file: ${tempPath}`);
                         await ws.activeFileChooser.setFiles(tempPath);
@@ -1284,7 +1291,12 @@ wss.on('connection', async (ws) => {
 
             // -- Proxy reconfiguration (fast, no Tor - instant context swap) --
             if (msg.type === 'set_proxy') {
-                ws.proxyServer = msg.proxy || null;
+                const proxyStr = (msg.proxy || '').trim();
+                if (proxyStr && !/^(socks[45]|https?):\/\//i.test(proxyStr)) {
+                    console.warn(`[proxy] Rejected invalid proxy format: ${proxyStr}`);
+                    return;
+                }
+                ws.proxyServer = proxyStr || null;
                 ws.vpnEnabled = false; // proxy replaces vpn
                 try {
                     const currentUrl = p.url();
