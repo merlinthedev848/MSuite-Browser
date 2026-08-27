@@ -249,14 +249,8 @@ function connectWS(token) {
         statusDot.classList.replace('disconnected', 'connected');
         statusText.textContent = 'Connected';
         viewportContainer.focus();
-
-        // Stream startup failsafe: reveal the viewport promptly within 1.2s even if initial frame is delayed
-        setTimeout(() => {
-            if (!viewportContainer.classList.contains('ready')) {
-                hideOverlay();
-                viewportContainer.classList.add('ready');
-            }
-        }, 1200);
+        hideOverlay();
+        viewportContainer.classList.add('ready');
     };
 
     ws.onclose = (event) => {

@@ -676,9 +676,9 @@ async function renderErrorPage(page, url, errorMessage) {
 }
 
 // ---------- Connection-scoped Tab Management ----------
-async function createTab(ws) {
+async function createTab(ws, existingPage = null, existingClient = null) {
     const tabId = 'tab_' + (++ws.tabCounter);
-    const page = await ws.context.newPage();
+    const page = existingPage || await ws.context.newPage();
 
     // Spoof UA dynamically on page level
     const targetUA = ws.currentUserAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
@@ -753,10 +753,13 @@ async function createTab(ws) {
         } catch (_) {}
     });
 
-    const client = await page.context().newCDPSession(page);
-    await client.send('Page.enable');
+    const client = existingClient || await page.context().newCDPSession(page);
+    if (!existingClient) {
+        await client.send('Page.enable');
+    }
 
-    ws.tabs.set(tabId, { page, client, title: 'New Tab', url: 'about:blank', favicon: '' });
+    const currentUrl = page.url() || 'about:blank';
+    ws.tabs.set(tabId, { page, client, title: currentUrl.includes('google') ? 'Google' : 'New Tab', url: currentUrl, favicon: '' });
 
     page.on('framenavigated', (frame) => {
         if (frame !== page.mainFrame()) return;
@@ -895,41 +898,40 @@ async function startBrowser() {
     browserStarting = true;
 
     try {
-        console.log('[*] Initializing browser & adblocker...');
+        console.log('[*] Initializing browser...');
 
+        // Launch browser engine immediately (does not block on remote adblocker downloads)
+        browser = await launchBrowserInstance();
+        browserReady = true;
+        browserStarting = false;
+        console.log('[*] Browser engine ready.');
+
+        // Pre-warm context pool immediately so initial connection is instantaneous (<50ms)
+        prewarmContextPool().catch(() => {});
+
+        // Load adblocker in the background asynchronously
         const cacheDir = path.join(__dirname, 'adblocker_cache');
         fs.mkdirSync(cacheDir, { recursive: true });
         const cachePath = path.join(cacheDir, 'adblocker.bin');
 
-        const [launchedBrowser, loadedAdblocker] = await Promise.all([
-            launchBrowserInstance(),
-            PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch, {
-                path: cachePath,
-                read: async (p) => fs.promises.readFile(p),
-                write: async (p, content) => fs.promises.writeFile(p, content)
-            }).catch(e => {
-                console.warn('[!] Adblocker failed to load:', e.message);
-                return null;
-            })
-        ]);
-
-        browser = launchedBrowser;
-        adblocker = loadedAdblocker;
-
-        browserReady = true;
-        browserStarting = false;
-        console.log('[*] Browser ready.');
-
-        // Pre-warm one context immediately so the first connection is instant
-        prewarmContextPool().catch(e => console.warn('[!] Prewarm failed:', e.message));
+        PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch, {
+            path: cachePath,
+            read: async (p) => fs.promises.readFile(p),
+            write: async (p, content) => fs.promises.writeFile(p, content)
+        }).then(loadedBlocker => {
+            adblocker = loadedBlocker;
+            console.log('[*] Adblocker rules ready.');
+        }).catch(e => {
+            console.warn('[!] Adblocker background load warning:', e.message);
+        });
     } catch (err) {
         browserStarting = false;
         throw err;
     }
 }
 
-// Pre-warmed context pool — keeps one idle context ready to hand off on connection
-let contextPool = null; // BrowserContext | null
+// Pre-warmed context pool — keeps one idle context + page preloaded ready for instant handoff
+let contextPool = null; // { context, page, client } | null
 
 async function prewarmContextPool() {
     if (contextPool || !browserReady) return;
@@ -942,8 +944,12 @@ async function prewarmContextPool() {
             timezoneId: 'Europe/London',
             acceptDownloads: true
         });
-        contextPool = ctx;
-        console.log('[pool] Pre-warmed context ready.');
+        const page = await ctx.newPage();
+        const client = await ctx.newCDPSession(page);
+        await client.send('Page.enable');
+        page.goto('https://www.google.com').catch(() => {});
+        contextPool = { context: ctx, page, client };
+        console.log('[pool] Pre-warmed context with preloaded page ready.');
     } catch (e) {
         console.warn('[pool] Pre-warm failed:', e.message);
         contextPool = null;
@@ -968,13 +974,15 @@ async function initBrowserContext(ws) {
     }
 
     const needsProxy = ws.vpnEnabled || !!ws.proxyServer;
+    let prewarmed = null;
 
     // Claim the pre-warmed pooled context if available and no proxy is needed
     if (!needsProxy && contextPool) {
         console.log('[pool] Handing off pre-warmed context to new session (instant).');
-        ws.context = contextPool;
+        ws.context = contextPool.context;
+        prewarmed = { page: contextPool.page, client: contextPool.client };
         contextPool = null;
-        // Immediately start warming the next context for the next connection
+        // Immediately warm the next context in the background for the next session
         prewarmContextPool().catch(e => console.warn('[pool] Re-warm failed:', e.message));
     } else {
         // Create a fresh context (proxy scenario or pool was empty)
@@ -1036,6 +1044,8 @@ async function initBrowserContext(ws) {
             }, { passive: true, capture: true });
         }, targetUA);
     } catch (_) {}
+
+    return prewarmed;
 }
 
 // ---------- WebSocket Connection Handler ----------
@@ -1077,19 +1087,22 @@ wss.on('connection', async (ws) => {
     }
 
     // Create client-isolated BrowserContext
+    let prewarmed = null;
     try {
-        await initBrowserContext(ws);
+        prewarmed = await initBrowserContext(ws);
     } catch (err) {
         console.error('[!] Failed to create browser context:', err.message);
         ws.close(1011, 'Failed to initialize session');
         return;
     }
 
-    // Initialize first tab for this connection
-    const tabId = await createTab(ws);
+    // Initialize first tab for this connection (instant from prewarmed context)
+    const tabId = await createTab(ws, prewarmed?.page, prewarmed?.client);
     await switchTab(ws, tabId);
-    const initialPage = ws.tabs.get(tabId).page;
-    initialPage.goto('https://www.google.com').catch(e => console.warn(`[nav] ${e.message}`));
+    if (!prewarmed) {
+        const initialPage = ws.tabs.get(tabId).page;
+        initialPage.goto('https://www.google.com').catch(e => console.warn(`[nav] ${e.message}`));
+    }
 
     ws.on('message', async (raw) => {
         // --- WS message rate limiting — drop excessive clients ---
