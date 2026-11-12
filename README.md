@@ -13,13 +13,46 @@ A secure, performant Remote Browser Isolation (RBI) tool built with Node.js and 
 - **Optional Cloudflare WARP VPN** (userspace SOCKS5) and custom proxies.
 - **Full input passthrough** for mouse, keyboard, and common shortcuts.
 
-## One-Line Quick Install (Debian/Ubuntu)
+## Install / update (Debian/Ubuntu)
+
+### If the GitHub repo is **private** (current default)
+
+Unauthenticated `wget`/`curl` to `raw.githubusercontent.com` will download `404: Not Found` and the installer cannot run. Use git with credentials instead:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/merlinthedev848/browser/main/install.sh | bash
+# First time
+git clone https://github.com/merlinthedev848/browser.git virtual-browser
+cd virtual-browser
+chmod +x install.sh
+./install.sh
+
+# Later updates (from inside the clone, or let install.sh reset --hard origin/main)
+cd virtual-browser
+git fetch origin main && git reset --hard origin/main
+./install.sh
 ```
 
-The script **requires** a strong password (no default). Prefer cloning the repo and reviewing `install.sh` before piping to bash when you can.
+Or with a Personal Access Token:
+
+```bash
+curl -fsSL -H "Authorization: Bearer YOUR_GH_PAT" \
+  https://raw.githubusercontent.com/merlinthedev848/browser/main/install.sh \
+  -o install.sh
+chmod +x install.sh && ./install.sh
+```
+
+### If you make the repo **public**
+
+Then the classic one-liner works:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/merlinthedev848/browser/main/install.sh -o install.sh
+chmod +x install.sh && ./install.sh
+```
+
+(`curl ... | bash` also works once public; prefer saving the script first so a 404 cannot be executed.)
+
+The script **requires** a strong password (8+ chars, not `password123`). Existing `vbrowser` container passwords are reused when present.
 
 ## Manual Docker Deployment
 

@@ -5,6 +5,16 @@ echo "==================================================="
 echo "  Virtual Browser - Quick Install for Debian       "
 echo "==================================================="
 
+# Guard: if this file was saved from a GitHub 404 (private/raw URL without auth), abort early.
+if ! head -1 "$0" | grep -q '^#!/bin/bash'; then
+    echo "[!] This install.sh does not look like a valid script."
+    echo "    If you used wget/curl against raw.githubusercontent.com and the repo is"
+    echo "    private, you likely saved a '404: Not Found' body. Clone with git auth instead:"
+    echo "      git clone https://github.com/merlinthedev848/browser.git virtual-browser"
+    echo "      cd virtual-browser && ./install.sh"
+    exit 1
+fi
+
 # 1. Install system dependencies
 echo "[*] Installing required system packages (Git & Docker)..."
 sudo apt-get update -y -q
@@ -17,15 +27,29 @@ sudo systemctl enable --now docker
 REPO_URL="https://github.com/merlinthedev848/browser.git"
 INSTALL_DIR="virtual-browser"
 
-if [ -d "$INSTALL_DIR/.git" ]; then
-    echo "[*] Existing installation found — updating to latest version..."
-    cd "$INSTALL_DIR"
+# If we are already inside a clone of this repo, update in place instead of nesting
+if [ -f "./server.js" ] && [ -f "./Dockerfile" ] && [ -d "./.git" ]; then
+    echo "[*] Running from an existing repo checkout — updating this directory..."
     git fetch origin main
     git reset --hard origin/main
-else
-    echo "[*] Cloning the Virtual Browser repository..."
-    git clone "$REPO_URL" "$INSTALL_DIR"
-    cd "$INSTALL_DIR"
+    INSTALL_DIR="."
+fi
+
+if [ "$INSTALL_DIR" != "." ]; then
+    if [ -d "$INSTALL_DIR/.git" ]; then
+        echo "[*] Existing installation found — updating to latest version..."
+        cd "$INSTALL_DIR"
+        git fetch origin main
+        git reset --hard origin/main
+    else
+        echo "[*] Cloning the Virtual Browser repository..."
+        if ! git clone "$REPO_URL" "$INSTALL_DIR"; then
+            echo "[!] git clone failed. If the repo is private, authenticate first, e.g.:"
+            echo "    git clone https://<TOKEN>@github.com/merlinthedev848/browser.git $INSTALL_DIR"
+            exit 1
+        fi
+        cd "$INSTALL_DIR"
+    fi
 fi
 
 # 3. Ensure persistent data directory exists
