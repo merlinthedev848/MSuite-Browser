@@ -159,10 +159,8 @@ loginForm.addEventListener('submit', async (e) => {
             method:  'POST',
             headers: {
                 'Content-Type': 'application/json',
-                // Include same-origin header so CSRF origin check passes from browser
                 'X-Requested-With': 'XMLHttpRequest'
             },
-            // Send the raw value — no client-side hashing (that would be security theatre)
             body: JSON.stringify({ password: rawPassword }),
             credentials: 'same-origin'
         });
@@ -172,12 +170,12 @@ loginForm.addEventListener('submit', async (e) => {
         const data = await res.json();
 
         if (data.success) {
-            // Store token and immediately clear the password field
-            sessionStorage.setItem('vb_token', data.token);
+            // Marker only — real session is the HttpOnly cookie set by the server
+            sessionStorage.setItem('vb_token', '1');
             passwordInput.value = '';
             loginScreen.classList.add('hidden');
             appContainer.classList.remove('hidden');
-            initApp(data.token);
+            initApp();
         } else {
             // Show server error — escape the string to prevent reflected XSS
             const msg = String(data.error || 'Incorrect password').slice(0, 200);
@@ -209,8 +207,15 @@ loginForm.addEventListener('submit', async (e) => {
 });
 
 // ---------- Main App ----------
-function resetToLogin(errorMsg) {
+async function logoutServer() {
+    try {
+        await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+    } catch (_) {}
+}
+
+function resetToLogin(errorMsg, { revoke = true } = {}) {
     sessionStorage.removeItem('vb_token');
+    if (revoke) logoutServer();
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     reconnectAttempts = 0;
     appInitialized = false;
@@ -229,19 +234,19 @@ function resetToLogin(errorMsg) {
     loginBtn.querySelector('span').textContent = 'Connect';
 }
 
-function initApp(token) {
+function initApp() {
     if (appInitialized) return;
     appInitialized = true;
     reconnectAttempts = 0;
-
-    connectWS(token);
+    connectWS();
 }
 
-function connectWS(token) {
+function connectWS() {
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${proto}//${location.host}/?token=${token}`);
+    // Auth via HttpOnly cookie (same-origin). Do not put tokens in the URL.
+    ws = new WebSocket(`${proto}//${location.host}/`);
     ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
@@ -254,7 +259,6 @@ function connectWS(token) {
     };
 
     ws.onclose = (event) => {
-        // If the socket was closed due to auth failure (code 4001 or 1008 or missing token)
         if (event.code === 4001 || event.code === 1008 || !sessionStorage.getItem('vb_token')) {
             resetToLogin('Session expired or unauthorized. Please log in again.');
             return;
@@ -271,8 +275,7 @@ function connectWS(token) {
         showOverlay(`Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
         viewportContainer.classList.remove('ready');
 
-        // Retry with brief delay
-        reconnectTimer = setTimeout(() => connectWS(token), 2000);
+        reconnectTimer = setTimeout(() => connectWS(), 2000);
     };
 
     ws.onerror = () => {
@@ -361,6 +364,10 @@ function connectWS(token) {
 
             case 'auth_error':
                 resetToLogin(msg.error || 'Session expired. Please log in again.');
+                break;
+
+            case 'error':
+                if (msg.error) showOverlay(String(msg.error).slice(0, 200));
                 break;
 
             case 'loading_state':
@@ -800,12 +807,35 @@ function addDownloadItem(filename, url) {
     const empty = downloadsList.querySelector('.downloads-empty');
     if (empty) empty.remove();
 
+    const safeName = String(filename || 'download').slice(0, 180);
+    let safeUrl = String(url || '');
+    try {
+        const parsed = new URL(safeUrl, location.origin);
+        if (parsed.origin !== location.origin || !parsed.pathname.startsWith('/downloads/')) {
+            safeUrl = '#';
+        } else {
+            safeUrl = parsed.pathname + parsed.search;
+        }
+    } catch {
+        safeUrl = '#';
+    }
+
     const item = document.createElement('div');
     item.className = 'download-item';
-    item.innerHTML = `
-        <span class="download-item-name" title="${filename}">📄 ${filename}</span>
-        <a class="download-item-link" href="${url}" download="${filename}" target="_blank">Save ↓</a>
-    `;
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'download-item-name';
+    nameEl.title = safeName;
+    nameEl.textContent = safeName;
+
+    const linkEl = document.createElement('a');
+    linkEl.className = 'download-item-link';
+    linkEl.href = safeUrl;
+    linkEl.download = safeName;
+    linkEl.textContent = 'Save ↓';
+
+    item.appendChild(nameEl);
+    item.appendChild(linkEl);
     downloadsList.prepend(item);
 }
 
@@ -822,6 +852,11 @@ localFileInput.addEventListener('change', () => {
 
 uploadSendBtn.addEventListener('click', () => {
     if (!pendingUploadFile) return;
+    const MAX_UPLOAD = 8 * 1024 * 1024;
+    if (pendingUploadFile.size > MAX_UPLOAD) {
+        alert('File is too large (max 8 MB).');
+        return;
+    }
     const reader = new FileReader();
     reader.onload = (e) => {
         const base64 = e.target.result.split(',')[1];
@@ -984,8 +1019,10 @@ qualitySelect.addEventListener('change', () => {
         sendMsg({ type: 'set_stream_quality', format: 'png' });
     } else if (val === 'jpeg_98') {
         sendMsg({ type: 'set_stream_quality', format: 'jpeg', quality: 98 });
-    } else {
+    } else if (val === 'jpeg_90') {
         sendMsg({ type: 'set_stream_quality', format: 'jpeg', quality: 90 });
+    } else {
+        sendMsg({ type: 'set_stream_quality', format: 'jpeg', quality: 80 });
     }
 });
 
@@ -1034,17 +1071,12 @@ const winClose    = document.querySelector('.win-close');
 
 if (winMinimize) {
     winMinimize.addEventListener('click', () => {
-        // Minimize: logout/return to login screen cleanly
-        if (ws) ws.close();
-        appContainer.classList.add('hidden');
-        loginScreen.classList.remove('hidden');
-        passwordInput.value = '';
+        resetToLogin();
         passwordInput.focus();
     });
 }
 if (winMaximize) {
     winMaximize.addEventListener('click', () => {
-        // Maximize: Request full screen
         if (!document.fullscreenElement) {
             document.documentElement.requestFullscreen().catch(() => {});
         } else {
@@ -1055,18 +1087,25 @@ if (winMaximize) {
 if (winClose) {
     winClose.addEventListener('click', () => {
         if (confirm('Are you sure you want to close the browser session and exit?')) {
-            if (ws) ws.close();
-            appContainer.classList.add('hidden');
-            loginScreen.classList.remove('hidden');
+            resetToLogin();
             passwordInput.value = '';
         }
     });
 }
 
 // ---------- Bootstrap Stored Session ----------
-const storedToken = sessionStorage.getItem('vb_token');
-if (storedToken) {
-    loginScreen.classList.add('hidden');
-    appContainer.classList.remove('hidden');
-    initApp(storedToken);
-}
+(async () => {
+    try {
+        const res = await fetch('/api/session', { credentials: 'same-origin' });
+        if (!res.ok) {
+            sessionStorage.removeItem('vb_token');
+            return;
+        }
+        sessionStorage.setItem('vb_token', '1');
+        loginScreen.classList.add('hidden');
+        appContainer.classList.remove('hidden');
+        initApp();
+    } catch (_) {
+        sessionStorage.removeItem('vb_token');
+    }
+})();

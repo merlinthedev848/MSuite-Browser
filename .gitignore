@@ -1,3 +1,6 @@
 node_modules/
 .DS_Store
-package-lock.json
+browser_data/
+adblocker_cache/
+*.log
+.env

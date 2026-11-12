@@ -1,86 +1,206 @@
 const express = require('express');
 const { chromium } = require('playwright');
 const { PlaywrightBlocker } = require('@ghostery/adblocker-playwright');
-const fetch = require('cross-fetch');
 const WebSocket = require('ws');
 const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
-const url = require('url');
 const fs = require('fs');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const PASSWORD = process.env.PASSWORD || 'password123';
+const PASSWORD = process.env.PASSWORD || '';
+const NODE_ENV = process.env.NODE_ENV || 'production';
+const ALLOW_PRIVATE_NAV = process.env.ALLOW_PRIVATE_NAV === '1';
+const MAX_TABS_PER_SESSION = parseInt(process.env.MAX_TABS || '8', 10);
+const MAX_WS_SESSIONS = parseInt(process.env.MAX_WS_SESSIONS || '6', 10);
+const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_BYTES || String(8 * 1024 * 1024), 10);
+const IDLE_TTL_MS = parseInt(process.env.IDLE_TTL_MS || String(2 * 60 * 60 * 1000), 10); // 2h idle
+const TOKEN_TTL_MS = parseInt(process.env.TOKEN_TTL_MS || String(12 * 60 * 60 * 1000), 10); // 12h absolute
+
+const COOKIE_NAME = 'vb_session';
+const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 
 // ---------- Startup security assertion ----------
-// Refuse to boot with the default password in production
-if (PASSWORD === 'password123') {
-    console.warn('[⚠️  SECURITY] Running with default password. Set the PASSWORD environment variable.');
+if (!PASSWORD || PASSWORD === 'password123') {
+    console.error('[FATAL] Refusing to start with missing or default PASSWORD. Set a strong PASSWORD env var (8+ chars, not password123).');
+    process.exit(1);
 }
-// Enforce minimum password length
 if (PASSWORD.length < 8) {
     console.error('[FATAL] PASSWORD must be at least 8 characters. Exiting.');
     process.exit(1);
 }
 
-// ---------- Global error protection ----------
 process.on('uncaughtException', (err) => {
     console.error('[FATAL] Uncaught exception:', err.message, '\n', err.stack);
+    process.exit(1);
 });
 process.on('unhandledRejection', (reason) => {
     console.error('[FATAL] Unhandled rejection:', reason);
 });
 
-// ---------- Trusted proxy IP resolution ----------
-// Prevent X-Forwarded-For spoofing by only trusting the socket's real remote address.
-// If running behind a TRUSTED reverse proxy (e.g. Nginx on same host), set TRUST_PROXY=1.
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 
 function getClientIp(req) {
     if (TRUST_PROXY) {
         const xff = req.headers['x-forwarded-for'];
-        // Only take the FIRST entry from XFF — that's the real client behind a trusted proxy
         const ip = xff ? xff.split(',')[0].trim() : req.socket.remoteAddress;
         return ip || 'unknown';
     }
-    // Without proxy trust, always use the direct socket address (cannot be spoofed)
     return req.socket.remoteAddress || 'unknown';
 }
 
+function hashToken(token) {
+    return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function parseCookies(header) {
+    const out = {};
+    if (!header) return out;
+    for (const part of String(header).split(';')) {
+        const idx = part.indexOf('=');
+        if (idx === -1) continue;
+        const k = part.slice(0, idx).trim();
+        const v = part.slice(idx + 1).trim();
+        if (k) out[k] = decodeURIComponent(v);
+    }
+    return out;
+}
+
+function extractRawToken(req) {
+    const cookies = parseCookies(req.headers?.cookie || req.headers?.Cookie);
+    if (cookies[COOKIE_NAME]) return cookies[COOKIE_NAME];
+
+    const authHeader = req.headers?.authorization || '';
+    if (authHeader.startsWith('Bearer ')) return authHeader.slice(7).trim();
+
+    // Legacy query param support (discouraged; still accepted briefly for reconnects)
+    try {
+        const u = new URL(req.url || '/', 'http://localhost');
+        if (u.searchParams.get('token')) return u.searchParams.get('token');
+    } catch (_) {}
+    return null;
+}
+
+function isTokenValid(meta, now = Date.now()) {
+    if (!meta) return false;
+    if (now - meta.createdAt > TOKEN_TTL_MS) return false;
+    if (now - (meta.lastActivity || meta.createdAt) > IDLE_TTL_MS) return false;
+    return true;
+}
+
+function touchToken(meta) {
+    if (meta) meta.lastActivity = Date.now();
+}
+
+function sessionCookie(token, req) {
+    const maxAge = Math.floor(TOKEN_TTL_MS / 1000);
+    const proto = (req.headers['x-forwarded-proto'] || '').toString().split(',')[0].trim();
+    const secure = req.secure || proto === 'https' || process.env.FORCE_SECURE_COOKIE === '1';
+    return `${COOKIE_NAME}=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
+}
+
+function clearSessionCookie(req) {
+    const proto = (req.headers['x-forwarded-proto'] || '').toString().split(',')[0].trim();
+    const secure = req.secure || proto === 'https' || process.env.FORCE_SECURE_COOKIE === '1';
+    return `${COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure ? '; Secure' : ''}`;
+}
+
+function sanitizeDownloadName(name) {
+    const base = path.basename(String(name || 'download')).replace(/[^\w.\-()+ ]+/g, '_').trim();
+    return base.slice(0, 180) || 'download';
+}
+
+function resolveInsideDir(dir, name) {
+    const safe = sanitizeDownloadName(name);
+    const resolved = path.resolve(dir, safe);
+    if (!resolved.startsWith(path.resolve(dir) + path.sep)) {
+        throw new Error('Invalid path');
+    }
+    return { safe, resolved };
+}
+
+function isPrivateOrBlockedHost(hostname) {
+    if (!hostname) return true;
+    const host = String(hostname).toLowerCase().replace(/^\[|\]$/g, '');
+    if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) return true;
+    if (host === 'metadata.google.internal') return true;
+
+    const plain = host.replace(/^::ffff:/, '');
+    if (plain === '::1') return true;
+    if (/^127\./.test(plain)) return true;
+    if (/^10\./.test(plain)) return true;
+    if (/^192\.168\./.test(plain)) return true;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(plain)) return true;
+    if (/^169\.254\./.test(plain)) return true;
+    if (/^0\./.test(plain)) return true;
+    if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(plain)) return true; // CGNAT
+    return false;
+}
+
+function assertSafeNavigationUrl(rawUrl) {
+    let parsed;
+    try {
+        parsed = new URL(rawUrl);
+    } catch {
+        throw new Error('Invalid URL');
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new Error('Only http/https navigation is allowed');
+    }
+    if (!ALLOW_PRIVATE_NAV && isPrivateOrBlockedHost(parsed.hostname)) {
+        throw new Error('Navigation to private/internal addresses is blocked');
+    }
+    return parsed.toString();
+}
+
 // ---------- Auth state ----------
-const validTokens = new Map();   // token -> { createdAt, ip, lastActivity }
+const validTokens = new Map();   // tokenHash -> { createdAt, ip, lastActivity }
 const loginAttempts = new Map(); // ip -> { count, lockUntil, firstAttempt }
 const globalRateMap = new Map(); // ip -> { requests, windowStart }
+const activeSockets = new Set();
 
-const TOKEN_TTL_MS        = 12 * 60 * 60 * 1000; // 12 hours
-const LOCKOUT_THRESHOLD   = 5;                    // failed attempts before lockout
-const GLOBAL_REQ_LIMIT    = 60;                   // max requests per IP per 60s window
-const GLOBAL_REQ_WINDOW   = 60_000;
-const MAX_ATTEMPTS_STORED = 5_000;                // cap map size to resist memory DoS
-const MAX_TOKENS_STORED   = 500;
+const LOCKOUT_THRESHOLD = 5;
+const GLOBAL_REQ_LIMIT = 120;
+const GLOBAL_REQ_WINDOW = 60_000;
+const MAX_ATTEMPTS_STORED = 5_000;
+const MAX_TOKENS_STORED = 500;
 
-const SESSIONS_FILE = path.join(__dirname, 'browser_data', 'sessions.json');
+const dataRoot = path.join(__dirname, 'browser_data');
+const SESSIONS_FILE = path.join(dataRoot, 'sessions.json');
+const downloadsDir = path.join(dataRoot, 'downloads');
+fs.mkdirSync(downloadsDir, { recursive: true });
 
 function loadSessions() {
     try {
-        if (fs.existsSync(SESSIONS_FILE)) {
-            const raw = fs.readFileSync(SESSIONS_FILE, 'utf8');
-            const data = JSON.parse(raw);
-            const now = Date.now();
-            if (Array.isArray(data)) {
-                for (const item of data) {
-                    if (item && item.token && item.createdAt && (now - item.createdAt <= TOKEN_TTL_MS)) {
-                        validTokens.set(item.token, {
-                            createdAt: item.createdAt,
-                            ip: item.ip || 'unknown',
-                            lastActivity: item.lastActivity || item.createdAt
-                        });
-                    }
-                }
-            }
-            console.log(`[auth] Restored ${validTokens.size} active sessions from disk.`);
+        if (!fs.existsSync(SESSIONS_FILE)) return;
+        const raw = fs.readFileSync(SESSIONS_FILE, 'utf8');
+        const data = JSON.parse(raw);
+        const now = Date.now();
+        if (!Array.isArray(data)) return;
+        for (const item of data) {
+            if (!item) continue;
+            // Support migration: prefer tokenHash; ignore legacy plaintext tokens
+            const key = item.tokenHash || (item.token ? hashToken(item.token) : null);
+            if (!key || !item.createdAt) continue;
+            const meta = {
+                createdAt: item.createdAt,
+                ip: item.ip || 'unknown',
+                lastActivity: item.lastActivity || item.createdAt
+            };
+            if (isTokenValid(meta, now)) validTokens.set(key, meta);
         }
+        console.log(`[auth] Restored ${validTokens.size} active sessions from disk.`);
     } catch (e) {
         console.warn('[auth] Could not load saved sessions:', e.message);
     }
@@ -88,26 +208,26 @@ function loadSessions() {
 
 function saveSessions() {
     try {
-        const data = Array.from(validTokens.entries()).map(([token, meta]) => ({
-            token,
+        const data = Array.from(validTokens.entries()).map(([tokenHash, meta]) => ({
+            tokenHash,
             createdAt: meta.createdAt,
             ip: meta.ip,
             lastActivity: meta.lastActivity
         }));
-        fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data), 'utf8');
+        const tmp = SESSIONS_FILE + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
+        fs.renameSync(tmp, SESSIONS_FILE);
     } catch (_) {}
 }
 
-// Load existing sessions on boot
 loadSessions();
 
-// Periodic cleanup — runs every 10 minutes
 setInterval(() => {
     const now = Date.now();
     let cleaned = false;
-    for (const [token, v] of validTokens) {
-        if (now - v.createdAt > TOKEN_TTL_MS) {
-            validTokens.delete(token);
+    for (const [tokenHash, v] of validTokens) {
+        if (!isTokenValid(v, now)) {
+            validTokens.delete(tokenHash);
             cleaned = true;
         }
     }
@@ -122,10 +242,9 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 // ---------- Middleware ----------
-app.use(express.json({ limit: '512b' })); // tighten body limit — login payload is tiny
+app.use(express.json({ limit: '512b' }));
 app.set('trust proxy', TRUST_PROXY ? 1 : false);
 
-// --- Global per-IP request rate limiter (applied to ALL routes) ---
 app.use((req, res, next) => {
     const ip = getClientIp(req);
     const now = Date.now();
@@ -137,7 +256,6 @@ app.use((req, res, next) => {
     }
     entry.requests++;
 
-    // Enforce map size cap
     if (globalRateMap.size > MAX_ATTEMPTS_STORED) {
         const oldest = [...globalRateMap.entries()].sort((a, b) => a[1].windowStart - b[1].windowStart)[0];
         if (oldest) globalRateMap.delete(oldest[0]);
@@ -152,19 +270,11 @@ app.use((req, res, next) => {
     next();
 });
 
-// --- Hardened security headers (applied to ALL responses) ---
 app.use((req, res, next) => {
-    // Anti-clickjacking
     res.setHeader('X-Frame-Options', 'DENY');
-    // Disable MIME sniffing
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    // XSS filter (legacy browsers)
-    res.setHeader('X-XSS-Protection', '1; mode=block');
-    // Do not send Referer to external sites
     res.setHeader('Referrer-Policy', 'no-referrer');
-    // Restrict browser features
     res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(), payment=()');
-    // Strict CSP — no inline scripts, no eval, only self + WS
     res.setHeader('Content-Security-Policy', [
         "default-src 'self'",
         "script-src 'self'",
@@ -177,59 +287,64 @@ app.use((req, res, next) => {
         "form-action 'self'",
         "frame-ancestors 'none'"
     ].join('; '));
-    // HSTS — force HTTPS for 1 year (enable when TLS-terminated)
-    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-    // Prevent caching of authenticated responses
     res.setHeader('Cache-Control', 'no-store');
+
+    const proto = (req.headers['x-forwarded-proto'] || '').toString().split(',')[0].trim();
+    if (req.secure || proto === 'https') {
+        res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
     next();
 });
 
 app.use(express.static(path.join(__dirname, 'public'), {
-    // Serve static files with a permissive cache for assets only
     setHeaders: (res, filePath) => {
-        if (filePath.endsWith('.html')) {
-            res.setHeader('Cache-Control', 'no-store');
-        }
+        if (filePath.endsWith('.html')) res.setHeader('Cache-Control', 'no-store');
+        else res.setHeader('Cache-Control', 'public, max-age=300');
     }
 }));
 
-// Expose browser downloads folder with restricted headers
-const downloadsDir = path.join(__dirname, 'browser_data', 'downloads');
-fs.mkdirSync(downloadsDir, { recursive: true });
-app.use('/downloads', express.static(downloadsDir, {
+function requireSession(req, res, next) {
+    const raw = extractRawToken(req);
+    if (!raw) return res.status(401).json({ error: 'Unauthorized' });
+    const meta = validTokens.get(hashToken(raw));
+    if (!isTokenValid(meta)) {
+        if (meta) {
+            validTokens.delete(hashToken(raw));
+            saveSessions();
+        }
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    touchToken(meta);
+    req.sessionToken = raw;
+    req.sessionMeta = meta;
+    next();
+}
+
+app.use('/downloads', requireSession, express.static(downloadsDir, {
     dotfiles: 'deny',
+    index: false,
     setHeaders: (res) => {
         res.setHeader('Content-Disposition', 'attachment');
         res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Cache-Control', 'private, no-store');
     }
 }));
 
 // =============================================================================
-// THREAT INTELLIGENCE ENGINE
+// THREAT INTELLIGENCE
 // =============================================================================
-// Layers:
-//   1. Local public blocklist  — hourly refresh from ipsum/Firehol/abuse.ch feeds (no key needed)
-//   2. AbuseIPDB reputation    — per-login check + auto-report on lockout (free API key)
-//   3. Security audit log      — structured JSONL log written to browser_data/security.log
-// =============================================================================
-
-const ABUSEIPDB_KEY        = process.env.ABUSEIPDB_KEY || null;
+const ABUSEIPDB_KEY = process.env.ABUSEIPDB_KEY || null;
 const ABUSEIPDB_BLOCK_SCORE = parseInt(process.env.ABUSEIPDB_BLOCK_SCORE || '80', 10);
+const securityLogPath = path.join(dataRoot, 'security.log');
+const abuseScoreCache = new Map();
+const SCORE_CACHE_TTL = 60 * 60 * 1000;
 
-const securityLogPath = path.join(__dirname, 'browser_data', 'security.log');
-const abuseScoreCache = new Map(); // ip -> { score, fetchedAt }
-const SCORE_CACHE_TTL = 60 * 60 * 1000; // 1 hour
-
-// ---------- Public blocklist (downloaded from open threat feeds) ----------
 let publicBlocklist = new Set();
 let blocklistLastUpdated = null;
 
 const BLOCKLIST_FEEDS = [
-    // ipsum: aggregation of many public IP blocklists (score >= 3 attacks across lists)
     'https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt',
-    // Emerging Threats known compromised hosts
     'https://rules.emergingthreats.net/blockrules/compromised-ips.txt',
-    // abuse.ch Feodo tracker botnet C2 IPs
     'https://feodotracker.abuse.ch/downloads/ipblocklist.txt',
 ];
 
@@ -242,13 +357,9 @@ async function refreshBlocklists() {
             const text = await res.text();
             for (const line of text.split('\n')) {
                 const trimmed = line.trim();
-                // Skip comment lines and blank lines
                 if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith(';')) continue;
-                // ipsum format: "1.2.3.4\t5" — take only the IP field
                 const ip = trimmed.split(/\s+/)[0];
-                if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
-                    newSet.add(ip);
-                }
+                if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) newSet.add(ip);
             }
         } catch (e) {
             console.warn(`[blocklist] Failed to fetch ${feedUrl}: ${e.message}`);
@@ -256,33 +367,28 @@ async function refreshBlocklists() {
     }
     publicBlocklist = newSet;
     blocklistLastUpdated = new Date().toISOString();
-    console.log(`[blocklist] Refreshed: ${publicBlocklist.size} blocked IPs loaded from ${BLOCKLIST_FEEDS.length} feeds.`);
+    console.log(`[blocklist] Refreshed: ${publicBlocklist.size} blocked IPs from ${BLOCKLIST_FEEDS.length} feeds.`);
 }
 
-// Refresh on boot then every hour
 refreshBlocklists().catch(() => {});
 setInterval(() => refreshBlocklists().catch(() => {}), 60 * 60 * 1000);
 
-// ---------- Private / loopback IP guard ----------
 function isPrivateIp(ip) {
     if (!ip || ip === '::1' || ip === '127.0.0.1') return true;
-    // Strip IPv6-mapped IPv4 prefix
     const plain = ip.replace(/^::ffff:/, '');
-    return /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|0\.)/.test(plain);
+    return /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|0\.|169\.254\.)/.test(plain);
 }
 
-// ---------- Security audit log writer ----------
 function securityLog(event) {
     const entry = JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n';
     fs.appendFile(securityLogPath, entry, () => {});
-    console.warn(`[security-log] ${JSON.stringify(event)}`);
+    if (NODE_ENV !== 'production' || process.env.DEBUG_SECURITY === '1') {
+        console.warn(`[security-log] ${JSON.stringify(event)}`);
+    }
 }
 
-// ---------- AbuseIPDB: check IP reputation ----------
 async function checkAbuseIPDB(ip) {
     if (!ABUSEIPDB_KEY || isPrivateIp(ip)) return null;
-
-    // Return cached score if fresh
     const cached = abuseScoreCache.get(ip);
     if (cached && Date.now() - cached.fetchedAt < SCORE_CACHE_TTL) return cached;
 
@@ -291,7 +397,7 @@ async function checkAbuseIPDB(ip) {
         const res = await fetch(
             `https://api.abuseipdb.com/api/v2/check?ipAddress=${encodeURIComponent(cleanIp)}&maxAgeInDays=30&verbose`,
             {
-                headers: { 'Key': ABUSEIPDB_KEY, 'Accept': 'application/json' },
+                headers: { Key: ABUSEIPDB_KEY, Accept: 'application/json' },
                 signal: AbortSignal.timeout(5_000)
             }
         );
@@ -311,69 +417,68 @@ async function checkAbuseIPDB(ip) {
     }
 }
 
-// ---------- AbuseIPDB: report an IP ----------
 async function reportToAbuseIPDB(ip, comment) {
     if (!ABUSEIPDB_KEY || isPrivateIp(ip)) return;
     try {
         const cleanIp = ip.replace(/^::ffff:/, '');
         const body = new URLSearchParams({
             ip: cleanIp,
-            categories: '18',   // 18 = Brute-Force
+            categories: '18',
             comment: comment.slice(0, 1024)
         });
         const res = await fetch('https://api.abuseipdb.com/api/v2/report', {
             method: 'POST',
-            headers: { 'Key': ABUSEIPDB_KEY, 'Content-Type': 'application/x-www-form-urlencoded' },
+            headers: { Key: ABUSEIPDB_KEY, 'Content-Type': 'application/x-www-form-urlencoded' },
             body: body.toString(),
             signal: AbortSignal.timeout(8_000)
         });
-        if (res.ok) {
-            console.log(`[abuseipdb] Reported ${cleanIp} to AbuseIPDB.`);
-        }
+        if (res.ok) console.log(`[abuseipdb] Reported ${cleanIp}.`);
     } catch (e) {
         console.warn(`[abuseipdb] Report failed for ${ip}: ${e.message}`);
     }
 }
 
-// ---------- Composite threat check (blocklist + AbuseIPDB) ----------
 async function isThreatIp(ip) {
-    // Layer 1: instant local blocklist hit
     const plain = ip.replace(/^::ffff:/, '');
     if (publicBlocklist.has(plain)) {
         return { blocked: true, reason: 'Public threat feed match', score: 100 };
     }
-    // Layer 2: AbuseIPDB real-time score
     const abuse = await checkAbuseIPDB(ip);
     if (abuse && abuse.score >= ABUSEIPDB_BLOCK_SCORE) {
-        return { blocked: true, reason: `AbuseIPDB score ${abuse.score}/100`, score: abuse.score, isp: abuse.isp, country: abuse.countryCode };
+        return {
+            blocked: true,
+            reason: `AbuseIPDB score ${abuse.score}/100`,
+            score: abuse.score,
+            isp: abuse.isp,
+            country: abuse.countryCode
+        };
     }
     return { blocked: false, score: abuse?.score ?? 0 };
 }
 
-// ---------- Security log admin endpoint ----------
-app.get('/api/security/log', (req, res) => {
-    // Only allow local access or authenticated session (check token in query)
-    const token = req.query.token;
-    if (!token || !validTokens.has(token)) {
-        return res.status(401).json({ error: 'Unauthorized' });
-    }
+app.get('/healthz', (_req, res) => {
+    res.json({
+        ok: true,
+        browserReady,
+        activeSockets: activeSockets.size,
+        sessions: validTokens.size
+    });
+});
+
+app.get('/api/security/log', requireSession, (req, res) => {
     try {
         const raw = fs.readFileSync(securityLogPath, 'utf8');
         const lines = raw.trim().split('\n').filter(Boolean);
-        // Return last 200 events
-        const entries = lines.slice(-200).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+        const entries = lines.slice(-200).map((l) => {
+            try { return JSON.parse(l); } catch { return null; }
+        }).filter(Boolean);
         res.json({ count: entries.length, events: entries.reverse() });
     } catch {
         res.json({ count: 0, events: [] });
     }
 });
 
-// Blocklist status endpoint
-app.get('/api/security/blocklist', (req, res) => {
-    const token = req.query.token;
-    if (!token || !validTokens.has(token)) {
-        return res.status(401).json({ error: 'Unauthorized' });
-    }
+app.get('/api/security/blocklist', requireSession, (_req, res) => {
     res.json({
         totalBlocked: publicBlocklist.size,
         lastUpdated: blocklistLastUpdated,
@@ -383,44 +488,33 @@ app.get('/api/security/blocklist', (req, res) => {
     });
 });
 
-
-
-// --- CSRF origin validation helper ---
 function validateOrigin(req) {
-    const origin = req.headers['origin'] || req.headers['referer'] || '';
-    const host   = req.headers['host'] || '';
-    // Allow requests from same host (direct browser submits) or no origin (same-origin same-tab)
-    if (!origin) return true; // No origin header means same-origin in most browsers
+    const origin = req.headers.origin || '';
+    const host = req.headers.host || '';
+    if (!origin) return false;
     try {
-        const originHost = new URL(origin).host;
-        return originHost === host;
+        return new URL(origin).host === host;
     } catch {
         return false;
     }
 }
 
-// ---------- Login endpoint ----------
 app.post('/api/login', async (req, res) => {
     const ip = getClientIp(req);
 
-    // CSRF origin check — reject cross-origin POST requests
     if (!validateOrigin(req)) {
         securityLog({ event: 'csrf_block', ip });
         return res.status(403).json({ success: false, error: 'Forbidden' });
     }
 
     const { password } = req.body || {};
-
-    // Strict type and length validation
     if (typeof password !== 'string' || password.length === 0 || password.length > 256) {
         return res.status(400).json({ success: false, error: 'Invalid request' });
     }
 
-    // ---- Layer 1: Public blocklist + AbuseIPDB threat check ----
-    // Run async, but don't let a slow API call block the response entirely
     const threatCheck = await Promise.race([
         isThreatIp(ip),
-        new Promise(resolve => setTimeout(() => resolve({ blocked: false, score: 0 }), 3000))
+        new Promise((resolve) => setTimeout(() => resolve({ blocked: false, score: 0 }), 3000))
     ]);
 
     if (threatCheck.blocked) {
@@ -428,7 +522,6 @@ app.post('/api/login', async (req, res) => {
         return res.status(403).json({ success: false, error: 'Access denied.' });
     }
 
-    // Check lockout state
     const attempt = loginAttempts.get(ip) || { count: 0, lockUntil: 0, firstAttempt: Date.now() };
     const now = Date.now();
 
@@ -440,44 +533,37 @@ app.post('/api/login', async (req, res) => {
             .json({ success: false, error: `Too many failed attempts. Try again in ${waitSec} seconds.` });
     }
 
-    // Constant-time password comparison (prevents timing attacks)
-    const inputHash    = crypto.createHash('sha256').update(password).digest();
+    const inputHash = crypto.createHash('sha256').update(password).digest();
     const expectedHash = crypto.createHash('sha256').update(PASSWORD).digest();
-    const isMatched    = crypto.timingSafeEqual(inputHash, expectedHash);
+    const isMatched = inputHash.length === expectedHash.length && crypto.timingSafeEqual(inputHash, expectedHash);
 
     if (isMatched) {
         loginAttempts.delete(ip);
 
-        // Cap token store to prevent memory DoS
         if (validTokens.size >= MAX_TOKENS_STORED) {
             const oldest = [...validTokens.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0];
             if (oldest) validTokens.delete(oldest[0]);
         }
 
         const token = crypto.randomBytes(32).toString('hex');
-        validTokens.set(token, { createdAt: now, ip, lastActivity: now });
+        validTokens.set(hashToken(token), { createdAt: now, ip, lastActivity: now });
         saveSessions();
-
+        res.setHeader('Set-Cookie', sessionCookie(token, req));
         securityLog({ event: 'login_success', ip, abuseScore: threatCheck.score });
         return res.json({ success: true, token });
     }
 
-    // ---- Failed login — update lockout and potentially report ----
     attempt.count++;
     const hitLockout = attempt.count >= LOCKOUT_THRESHOLD;
-
     if (hitLockout) {
         const lockSeconds = 60 * Math.pow(2, attempt.count - LOCKOUT_THRESHOLD);
         attempt.lockUntil = now + Math.min(lockSeconds * 1000, 24 * 60 * 60 * 1000);
-
-        // Report to AbuseIPDB asynchronously (do not block response)
         reportToAbuseIPDB(
             ip,
-            `Brute-force login attempt against a virtual browser application. ${attempt.count} failed attempts. Automatically reported.`
+            `Brute-force login attempt against a virtual browser application. ${attempt.count} failed attempts.`
         ).catch(() => {});
     }
 
-    // Cap attempts map size
     if (loginAttempts.size > MAX_ATTEMPTS_STORED) {
         const oldest = [...loginAttempts.entries()].sort((a, b) => a[1].firstAttempt - b[1].firstAttempt)[0];
         if (oldest) loginAttempts.delete(oldest[0]);
@@ -485,57 +571,78 @@ app.post('/api/login', async (req, res) => {
 
     loginAttempts.set(ip, attempt);
     securityLog({ event: 'login_failed', ip, count: attempt.count, locked: hitLockout, abuseScore: threatCheck.score });
-
     return res.status(401).json({ success: false, error: 'Incorrect password' });
+});
+
+app.post('/api/logout', (req, res) => {
+    if (!validateOrigin(req)) {
+        return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const raw = extractRawToken(req);
+    if (raw) {
+        validTokens.delete(hashToken(raw));
+        saveSessions();
+    }
+    res.setHeader('Set-Cookie', clearSessionCookie(req));
+    res.json({ success: true });
+});
+
+app.get('/api/session', (req, res) => {
+    const raw = extractRawToken(req);
+    if (!raw) return res.status(401).json({ authenticated: false });
+    const meta = validTokens.get(hashToken(raw));
+    if (!isTokenValid(meta)) return res.status(401).json({ authenticated: false });
+    touchToken(meta);
+    res.json({ authenticated: true });
 });
 
 // ---------- WebSocket Server ----------
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ noServer: true });
+const wss = new WebSocket.Server({ noServer: true, maxPayload: Math.max(MAX_UPLOAD_BYTES * 2, 2 * 1024 * 1024) });
 
-// ---------- WS message rate limiting ----------
-const WS_MSG_LIMIT  = 600; // max messages per 10s per connection
+const WS_MSG_LIMIT = 600;
 const WS_MSG_WINDOW = 10_000;
 
 server.on('upgrade', (request, socket, head) => {
     const ip = getClientIp(request);
-    const parsedUrl = url.parse(request.url, true);
+    const rawToken = extractRawToken(request);
+    const tokenHash = rawToken ? hashToken(rawToken) : null;
+    const tokenData = tokenHash ? validTokens.get(tokenHash) : null;
+    const isValid = isTokenValid(tokenData);
 
-    // Accept token from query param OR Authorization header
-    let token = parsedUrl.query.token;
-    const authHeader = request.headers['authorization'] || '';
-    if (authHeader.startsWith('Bearer ')) {
-        token = authHeader.slice(7).trim();
-    }
-
-    const tokenData = token ? validTokens.get(token) : null;
-    const isValid   = !!tokenData && (Date.now() - tokenData.createdAt <= TOKEN_TTL_MS);
-
-    if (tokenData) {
-        if (!isValid) {
-            validTokens.delete(token);
+    if (!isValid) {
+        if (tokenHash && tokenData) {
+            validTokens.delete(tokenHash);
             saveSessions();
-        } else {
-            tokenData.lastActivity = Date.now();
         }
+        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
     }
+
+    if (activeSockets.size >= MAX_WS_SESSIONS) {
+        socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+    }
+
+    touchToken(tokenData);
 
     wss.handleUpgrade(request, socket, head, (ws) => {
-        ws.isAuthorized = isValid;
+        ws.isAuthorized = true;
         ws.clientIp = ip;
+        ws.tokenHash = tokenHash;
         ws.msgCount = 0;
         ws.msgWindowStart = Date.now();
         wss.emit('connection', ws, request);
     });
 });
 
-// ---------- Global Browser Instance & Adblocker ----------
 let browser = null;
 let adblocker = null;
 let browserStarting = false;
 let browserReady = false;
 
-/** Send a frame to one client with explicit flow control */
 function sendFrameToClient(ws, data) {
     if (ws.readyState !== WebSocket.OPEN) return;
 
@@ -546,10 +653,9 @@ function sendFrameToClient(ws, data) {
 
     if (!ws.frameInFlight) {
         ws.frameInFlight = true;
-        const buffer = Buffer.from(data, 'base64');
+        const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, 'base64');
         ws.send(buffer);
 
-        // 1.5s fail-safe timeout to prevent stream freezing from dropped client acks
         ws.ackTimeout = setTimeout(() => {
             ws.frameInFlight = false;
             if (ws.lastFrameData) {
@@ -559,7 +665,9 @@ function sendFrameToClient(ws, data) {
             }
         }, 1500);
     } else {
+        // Drop intermediate frames — keep only the newest
         ws.lastFrameData = data;
+        ws.droppedFrames = (ws.droppedFrames || 0) + 1;
     }
 }
 
@@ -575,19 +683,17 @@ function sendTabState(ws) {
     ws.send(JSON.stringify({ type: 'tab_state', tabs: tabList }));
 }
 
-// ---------- Screencast Control ----------
 async function startScreencast(client, ws) {
     const format = ws?.streamFormat || 'jpeg';
-    const quality = ws?.streamQuality || 90;
+    const quality = ws?.streamQuality || 80;
+    const everyNthFrame = ws?.frameInFlight ? 2 : 1;
     const params = {
         format,
         maxWidth: 1920,
         maxHeight: 1080,
-        everyNthFrame: 1
+        everyNthFrame
     };
-    if (format === 'jpeg') {
-        params.quality = quality;
-    }
+    if (format === 'jpeg') params.quality = quality;
     await client.send('Page.startScreencast', params).catch(() => {});
 }
 
@@ -597,143 +703,102 @@ async function stopScreencast(client) {
 
 async function renderErrorPage(page, url, errorMessage) {
     if (page.isClosed()) return;
-    const errorHtml = `
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Navigation Error</title>
-        <style>
-            body {
-                background-color: #0f172a;
-                color: #f8fafc;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                display: flex;
-                flex-direction: column;
-                justify-content: center;
-                align-items: center;
-                height: 100vh;
-                margin: 0;
-                padding: 20px;
-                box-sizing: border-box;
-            }
-            .container {
-                max-width: 500px;
-                text-align: center;
-                background: #1e293b;
-                border: 1px solid #334155;
-                border-radius: 12px;
-                padding: 32px;
-                box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3);
-            }
-            h1 {
-                font-size: 22px;
-                margin-top: 0;
-                color: #ef4444;
-            }
-            p {
-                font-size: 14px;
-                color: #94a3b8;
-                line-height: 1.6;
-                word-break: break-all;
-            }
-            .url {
-                font-family: monospace;
-                background: #0f172a;
-                padding: 6px 10px;
-                border-radius: 6px;
-                border: 1px solid #1e293b;
-                margin: 16px 0;
-            }
-            .btn {
-                background: #3b82f6;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 10px 20px;
-                font-size: 14px;
-                font-weight: 600;
-                cursor: pointer;
-                transition: background 0.15s;
-                margin-top: 16px;
-            }
-            .btn:hover {
-                background: #2563eb;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Navigation Failed</h1>
-            <p>The virtual browser was unable to load the requested website:</p>
-            <div class="url">${url}</div>
-            <p><strong>Error:</strong> ${errorMessage}</p>
-            <button class="btn" onclick="location.reload()">Retry Connection</button>
-        </div>
-    </body>
-    </html>
-    `;
+    const safeUrl = escapeHtml(url);
+    const safeErr = escapeHtml(errorMessage);
+    const errorHtml = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Navigation Error</title>
+<style>
+body{background:#0f172a;color:#f8fafc;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;padding:20px}
+.container{max-width:500px;text-align:center;background:#1e293b;border:1px solid #334155;border-radius:12px;padding:32px}
+h1{font-size:22px;margin:0 0 12px;color:#ef4444}
+p{font-size:14px;color:#94a3b8;line-height:1.6;word-break:break-word}
+.url{font-family:monospace;background:#0f172a;padding:6px 10px;border-radius:6px;margin:16px 0}
+.btn{background:#3b82f6;color:#fff;border:none;border-radius:6px;padding:10px 20px;font-size:14px;font-weight:600;cursor:pointer;margin-top:16px}
+</style></head>
+<body><div class="container">
+<h1>Navigation Failed</h1>
+<p>The virtual browser was unable to load the requested website:</p>
+<div class="url">${safeUrl}</div>
+<p><strong>Error:</strong> ${safeErr}</p>
+<button class="btn" id="retry">Retry</button>
+</div>
+<script>
+document.getElementById('retry').addEventListener('click', function () {
+  location.href = ${JSON.stringify(String(url || ''))};
+});
+</script>
+</body></html>`;
     await page.setContent(errorHtml).catch(() => {});
 }
 
-// ---------- Connection-scoped Tab Management ----------
 async function createTab(ws, existingPage = null, existingClient = null) {
+    if (ws.tabs.size >= MAX_TABS_PER_SESSION) {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'error', error: `Tab limit reached (${MAX_TABS_PER_SESSION}). Close a tab first.` }));
+        }
+        return null;
+    }
+
     const tabId = 'tab_' + (++ws.tabCounter);
     const page = existingPage || await ws.context.newPage();
 
-    // Spoof UA dynamically on page level
-    const targetUA = ws.currentUserAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+    const targetUA = ws.currentUserAgent || DEFAULT_UA;
     await page.addInitScript((ua) => {
-        window.__customUA = ua;
+        try {
+            Object.defineProperty(navigator, 'userAgent', { get: () => ua });
+        } catch (_) {}
     }, targetUA).catch(() => {});
 
     if (adblocker && ws.adblockerEnabled) {
         await adblocker.enableBlockingInPage(page).catch(() => {});
     }
 
-    // Monitor page load events to broadcast load state to the client
     page.on('domcontentloaded', () => {
         if (tabId === ws.activeTabId && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'loading_state', loading: false }));
         }
         if (ws.zoomFactor) {
             page.evaluate((zoom) => {
-                document.body.style.zoom = zoom;
+                if (document.body) document.body.style.zoom = zoom;
             }, ws.zoomFactor).catch(() => {});
+        }
+        if (ws.isMuted) {
+            page.evaluate(() => {
+                document.querySelectorAll('video, audio').forEach((el) => { el.muted = true; });
+            }).catch(() => {});
         }
     });
 
-    // Intercept remote browser downloads
     page.on('download', async (download) => {
         try {
-            const filename = download.suggestedFilename();
-            const savePath = path.join(downloadsDir, filename);
-            await download.saveAs(savePath);
-            console.log(`[download] File downloaded: ${filename} to ${savePath}`);
+            const { safe, resolved } = resolveInsideDir(downloadsDir, download.suggestedFilename());
+            await download.saveAs(resolved);
+            console.log(`[download] Saved: ${safe}`);
             if (ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
                     type: 'download_ready',
-                    filename,
-                    url: `/downloads/${encodeURIComponent(filename)}`
+                    filename: safe,
+                    url: `/downloads/${encodeURIComponent(safe)}`
                 }));
             }
         } catch (err) {
-            console.error('[download] Failed to process download:', err.message);
+            console.error('[download] Failed:', err.message);
         }
     });
 
-    // Intercept file chooser dialog
     page.on('filechooser', async (fileChooser) => {
-        console.log('[ws] Remote site requested file upload');
         ws.activeFileChooser = fileChooser;
         if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'file_chooser_open' }));
         }
     });
+
     page.on('load', () => {
         if (tabId === ws.activeTabId && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'loading_state', loading: false }));
         }
     });
+
     page.on('request', (req) => {
         try {
             if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
@@ -743,6 +808,7 @@ async function createTab(ws, existingPage = null, existingClient = null) {
             }
         } catch (_) {}
     });
+
     page.on('requestfailed', (req) => {
         try {
             if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
@@ -754,32 +820,46 @@ async function createTab(ws, existingPage = null, existingClient = null) {
     });
 
     const client = existingClient || await page.context().newCDPSession(page);
-    if (!existingClient) {
-        await client.send('Page.enable');
-    }
+    if (!existingClient) await client.send('Page.enable');
 
     const currentUrl = page.url() || 'about:blank';
-    ws.tabs.set(tabId, { page, client, title: currentUrl.includes('google') ? 'Google' : 'New Tab', url: currentUrl, favicon: '' });
+    ws.tabs.set(tabId, {
+        page,
+        client,
+        title: currentUrl.includes('google') ? 'Google' : 'New Tab',
+        url: currentUrl,
+        favicon: '',
+        searchId: null
+    });
 
     page.on('framenavigated', (frame) => {
         if (frame !== page.mainFrame()) return;
         const t = ws.tabs.get(tabId);
         if (!t || page.isClosed()) return;
-
         t.url = frame.url();
 
         page.title()
-            .then(title => { if (t) t.title = title || 'New Tab'; })
+            .then((title) => { if (t) t.title = title || 'New Tab'; })
             .catch(() => {})
             .then(() => page.evaluate(() => {
                 const el = document.querySelector("link[rel~='icon'], link[rel='shortcut icon']");
-                return el ? el.href : (location.origin + '/favicon.ico');
+                return el ? el.href : '';
             }))
-            .then(fav => { if (t) t.favicon = fav || ''; })
+            .then((fav) => {
+                if (!t) return;
+                // Only keep same-origin-friendly Google favicon helper URLs or blank (CSP)
+                try {
+                    if (!fav) { t.favicon = ''; return; }
+                    const host = new URL(fav, t.url).hostname;
+                    t.favicon = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=32`;
+                } catch {
+                    t.favicon = '';
+                }
+            })
             .catch(() => {})
             .finally(() => {
                 sendTabState(ws);
-                if (tabId === ws.activeTabId) {
+                if (tabId === ws.activeTabId && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ type: 'url_changed', url: t.url }));
                 }
             });
@@ -812,29 +892,28 @@ async function switchTab(ws, tabId) {
     ws.lastFrameData = null;
 
     sendTabState(ws);
-    ws.send(JSON.stringify({ type: 'url_changed', url: t.url }));
+    if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'url_changed', url: t.url }));
+    }
 
-    // Apply active zoom factor to newly switched tab
     if (ws.zoomFactor && !t.page.isClosed()) {
         t.page.evaluate((zoom) => {
             if (document.body) document.body.style.zoom = zoom;
         }, ws.zoomFactor).catch(() => {});
     }
 
-    // Apply active mute state to newly switched tab
     if (ws.isMuted && !t.page.isClosed()) {
-        t.page.evaluate((muted) => {
-            document.querySelectorAll('video, audio').forEach(el => { el.muted = muted; });
-        }, true).catch(() => {});
+        t.page.evaluate(() => {
+            document.querySelectorAll('video, audio').forEach((el) => { el.muted = true; });
+        }).catch(() => {});
     }
 
     await startScreencast(t.client, ws);
 
-    // Immediate initial frame dispatch: paints the viewport instantly without waiting for network/DOM mutations
-    t.page.screenshot({ type: 'jpeg', quality: ws.streamQuality || 85 })
-        .then(buf => {
+    t.page.screenshot({ type: 'jpeg', quality: Math.min(ws.streamQuality || 80, 85) })
+        .then((buf) => {
             if (ws.activeTabId === tabId && ws.readyState === WebSocket.OPEN) {
-                sendFrameToClient(ws, buf.toString('base64'));
+                sendFrameToClient(ws, buf);
             }
         })
         .catch(() => {});
@@ -855,9 +934,10 @@ async function closeTab(ws, tabId) {
             ws.activeTabId = null;
             sendTabState(ws);
             const newId = await createTab(ws);
-            await switchTab(ws, newId);
-            const p = ws.tabs.get(newId).page;
-            p.goto('https://www.google.com').catch(e => console.warn(`[nav] ${e.message}`));
+            if (newId) {
+                await switchTab(ws, newId);
+                ws.tabs.get(newId).page.goto('https://www.google.com').catch((e) => console.warn(`[nav] ${e.message}`));
+            }
         }
     } else {
         sendTabState(ws);
@@ -873,23 +953,15 @@ async function launchBrowserInstance() {
         '--disable-accelerated-2d-canvas',
         '--enable-font-antialiasing',
         '--font-render-hinting=medium',
-        '--subpixel-text-rendering',
         '--force-color-profile=srgb'
     ];
 
     try {
-        console.log('[*] Launching Google Chrome channel (hardware/proprietary codec support)...');
-        return await chromium.launch({
-            headless: true,
-            channel: 'chrome',
-            args: launchArgs
-        });
+        console.log('[*] Launching Google Chrome channel...');
+        return await chromium.launch({ headless: true, channel: 'chrome', args: launchArgs });
     } catch (err) {
-        console.warn('[!] Google Chrome channel unavailable, falling back to bundled Chromium:', err.message);
-        return await chromium.launch({
-            headless: true,
-            args: launchArgs
-        });
+        console.warn('[!] Chrome channel unavailable, falling back to Chromium:', err.message);
+        return await chromium.launch({ headless: true, args: launchArgs });
     }
 }
 
@@ -899,17 +971,12 @@ async function startBrowser() {
 
     try {
         console.log('[*] Initializing browser...');
-
-        // Launch browser engine immediately (does not block on remote adblocker downloads)
         browser = await launchBrowserInstance();
         browserReady = true;
         browserStarting = false;
         console.log('[*] Browser engine ready.');
-
-        // Pre-warm context pool immediately so initial connection is instantaneous (<50ms)
         prewarmContextPool().catch(() => {});
 
-        // Load adblocker in the background asynchronously
         const cacheDir = path.join(__dirname, 'adblocker_cache');
         fs.mkdirSync(cacheDir, { recursive: true });
         const cachePath = path.join(cacheDir, 'adblocker.bin');
@@ -918,10 +985,10 @@ async function startBrowser() {
             path: cachePath,
             read: async (p) => fs.promises.readFile(p),
             write: async (p, content) => fs.promises.writeFile(p, content)
-        }).then(loadedBlocker => {
+        }).then((loadedBlocker) => {
             adblocker = loadedBlocker;
             console.log('[*] Adblocker rules ready.');
-        }).catch(e => {
+        }).catch((e) => {
             console.warn('[!] Adblocker background load warning:', e.message);
         });
     } catch (err) {
@@ -930,8 +997,7 @@ async function startBrowser() {
     }
 }
 
-// Pre-warmed context pool — keeps one idle context + page preloaded ready for instant handoff
-let contextPool = null; // { context, page, client } | null
+let contextPool = null;
 
 async function prewarmContextPool() {
     if (contextPool || !browserReady) return;
@@ -939,7 +1005,7 @@ async function prewarmContextPool() {
         const ctx = await browser.newContext({
             viewport: { width: 1920, height: 1080 },
             deviceScaleFactor: 1,
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+            userAgent: DEFAULT_UA,
             locale: 'en-US',
             timezoneId: 'Europe/London',
             acceptDownloads: true
@@ -949,24 +1015,20 @@ async function prewarmContextPool() {
         await client.send('Page.enable');
         page.goto('https://www.google.com').catch(() => {});
         contextPool = { context: ctx, page, client };
-        console.log('[pool] Pre-warmed context with preloaded page ready.');
+        console.log('[pool] Pre-warmed context ready.');
     } catch (e) {
         console.warn('[pool] Pre-warm failed:', e.message);
         contextPool = null;
     }
 }
 
-// Pre-start browser at server boot
-startBrowser().catch(err => {
+startBrowser().catch((err) => {
     console.error('[!] Pre-warm failed, will retry on first connection:', err.message);
 });
 
 async function initBrowserContext(ws) {
-    // Tear down any existing context for this session
     if (ws.context) {
-        for (const tabId of ws.tabs.keys()) {
-            ws.tabs.delete(tabId);
-        }
+        for (const tabId of [...ws.tabs.keys()]) ws.tabs.delete(tabId);
         ws.activeTabId = null;
         ws.tabCounter = 0;
         await ws.context.close().catch(() => {});
@@ -975,33 +1037,35 @@ async function initBrowserContext(ws) {
 
     const needsProxy = ws.vpnEnabled || !!ws.proxyServer;
     let prewarmed = null;
+    const ua = ws.currentUserAgent || DEFAULT_UA;
+    const isMobile = ws.isMobileUa === true;
 
-    // Claim the pre-warmed pooled context if available and no proxy is needed
-    if (!needsProxy && contextPool) {
-        console.log('[pool] Handing off pre-warmed context to new session (instant).');
+    if (!needsProxy && !isMobile && ua === DEFAULT_UA && contextPool) {
+        console.log('[pool] Handing off pre-warmed context.');
         ws.context = contextPool.context;
         prewarmed = { page: contextPool.page, client: contextPool.client };
         contextPool = null;
-        // Immediately warm the next context in the background for the next session
-        prewarmContextPool().catch(e => console.warn('[pool] Re-warm failed:', e.message));
+        prewarmContextPool().catch((e) => console.warn('[pool] Re-warm failed:', e.message));
     } else {
-        // Create a fresh context (proxy scenario or pool was empty)
         const contextOptions = {
-            viewport: { width: 1920, height: 1080 },
-            deviceScaleFactor: 1,
-            userAgent: ws.currentUserAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+            viewport: isMobile
+                ? { width: 390, height: 844 }
+                : { width: 1920, height: 1080 },
+            deviceScaleFactor: isMobile ? 3 : 1,
+            userAgent: ua,
             locale: 'en-US',
             timezoneId: 'Europe/London',
-            acceptDownloads: true
+            acceptDownloads: true,
+            isMobile,
+            hasTouch: isMobile
         };
 
         if (ws.vpnEnabled) {
-            // Cloudflare WARP SOCKS5 proxy — free, fast, userspace, no NET_ADMIN needed
             contextOptions.proxy = { server: 'socks5://127.0.0.1:40000' };
-            console.log('[vpn] Routing context via Cloudflare WARP socks5://127.0.0.1:40000');
+            console.log('[vpn] Routing via Cloudflare WARP socks5://127.0.0.1:40000');
         } else if (ws.proxyServer) {
             contextOptions.proxy = { server: ws.proxyServer };
-            console.log(`[proxy] Proxying browser context via: ${ws.proxyServer}`);
+            console.log(`[proxy] Proxying via: ${ws.proxyServer}`);
         }
 
         ws.context = await browser.newContext(contextOptions);
@@ -1010,8 +1074,8 @@ async function initBrowserContext(ws) {
     try {
         await ws.context.exposeBinding('__reportCursor', (source, cursor) => {
             if (source.page.isClosed()) return;
-            const tab = Array.from(ws.tabs.values()).find(t => t.page === source.page);
-            if (tab && ws.activeTabId && ws.tabs.get(ws.activeTabId) === tab) {
+            const tab = Array.from(ws.tabs.values()).find((t) => t.page === source.page);
+            if (tab && ws.activeTabId && ws.tabs.get(ws.activeTabId) === tab && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'cursor', cursor }));
             }
         });
@@ -1019,21 +1083,17 @@ async function initBrowserContext(ws) {
 
     try {
         await ws.context.exposeBinding('__reportCopy', (source, text) => {
-            if (source.page.isClosed()) return;
-            ws.send(JSON.stringify({ type: 'clipboard', text }));
+            if (source.page.isClosed() || ws.readyState !== WebSocket.OPEN) return;
+            ws.send(JSON.stringify({ type: 'clipboard', text: String(text || '').slice(0, 100_000) }));
         });
     } catch (_) {}
 
     try {
-        const targetUA = ws.currentUserAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
-        await ws.context.addInitScript((ua) => {
+        await ws.context.addInitScript(() => {
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            window.__customUA = ua;
 
             document.addEventListener('mouseover', (e) => {
-                try {
-                    window.__reportCursor(window.getComputedStyle(e.target).cursor);
-                } catch (_) {}
+                try { window.__reportCursor(window.getComputedStyle(e.target).cursor); } catch (_) {}
             }, { passive: true, capture: true });
 
             document.addEventListener('copy', () => {
@@ -1042,41 +1102,62 @@ async function initBrowserContext(ws) {
                     if (selected) window.__reportCopy(selected);
                 } catch (_) {}
             }, { passive: true, capture: true });
-        }, targetUA);
+        });
     } catch (_) {}
 
     return prewarmed;
 }
 
-// ---------- WebSocket Connection Handler ----------
+async function recreateSessionBrowser(ws, navigateTo) {
+    const target = navigateTo || 'https://www.google.com';
+    await initBrowserContext(ws);
+    const tabId = await createTab(ws);
+    if (!tabId) return;
+    await switchTab(ws, tabId);
+    const page = ws.tabs.get(tabId).page;
+    try {
+        const safe = assertSafeNavigationUrl(target);
+        await page.goto(safe).catch((e) => renderErrorPage(page, safe, e.message));
+    } catch (e) {
+        await renderErrorPage(page, target, e.message);
+    }
+}
+
 wss.on('connection', async (ws) => {
     if (!ws.isAuthorized) {
-        ws.send(JSON.stringify({ type: 'auth_error', error: 'Session expired. Please log in again.' }));
         ws.close(4001, 'Unauthorized');
         return;
     }
-    console.log('[+] Client connected');
 
-    // Setup connection-scoped state
+    if (activeSockets.size >= MAX_WS_SESSIONS) {
+        ws.close(1013, 'Too many sessions');
+        return;
+    }
+
+    activeSockets.add(ws);
+    console.log(`[+] Client connected (${activeSockets.size} active)`);
+
     ws.frameInFlight = false;
     ws.lastFrameData = null;
     ws.tabs = new Map();
     ws.activeTabId = null;
     ws.tabCounter = 0;
     ws.adblockerEnabled = true;
-    ws.currentUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+    ws.currentUserAgent = DEFAULT_UA;
+    ws.isMobileUa = false;
     ws.streamFormat = 'jpeg';
-    ws.streamQuality = 90;
+    ws.streamQuality = 80;
     ws.vpnEnabled = false;
+    ws.isMuted = false;
+    ws.zoomFactor = 1;
 
     let waited = 0;
     while (browserStarting && waited < 60_000) {
-        await new Promise(r => setTimeout(r, 250));
+        await new Promise((r) => setTimeout(r, 250));
         waited += 250;
     }
 
     if (!browserReady) {
-        console.log('[*] Browser not ready, starting now...');
         try {
             await startBrowser();
         } catch (err) {
@@ -1086,7 +1167,6 @@ wss.on('connection', async (ws) => {
         }
     }
 
-    // Create client-isolated BrowserContext
     let prewarmed = null;
     try {
         prewarmed = await initBrowserContext(ws);
@@ -1096,37 +1176,31 @@ wss.on('connection', async (ws) => {
         return;
     }
 
-    // Initialize first tab for this connection (instant from prewarmed context)
     const tabId = await createTab(ws, prewarmed?.page, prewarmed?.client);
-    await switchTab(ws, tabId);
-    if (!prewarmed) {
-        const initialPage = ws.tabs.get(tabId).page;
-        initialPage.goto('https://www.google.com').catch(e => console.warn(`[nav] ${e.message}`));
+    if (tabId) {
+        await switchTab(ws, tabId);
+        if (!prewarmed) {
+            ws.tabs.get(tabId).page.goto('https://www.google.com').catch((e) => console.warn(`[nav] ${e.message}`));
+        }
     }
 
     ws.on('message', async (raw) => {
-        // --- WS message rate limiting — drop excessive clients ---
         const now = Date.now();
         if (now - ws.msgWindowStart > WS_MSG_WINDOW) {
             ws.msgCount = 0;
             ws.msgWindowStart = now;
         }
         ws.msgCount++;
-        if (ws.msgCount > WS_MSG_LIMIT) {
-            console.warn(`[security] WS message flood from ${ws.clientIp} — dropping message (${ws.msgCount} in window)`);
-            return;
-        }
+        if (ws.msgCount > WS_MSG_LIMIT) return;
 
-        // Enforce maximum raw message size (16 KB for JSON messages, 201 MB for file uploads handled by base64 check)
-        if (raw.length > 210_000_000) {
-            console.warn(`[security] Oversized WS message from ${ws.clientIp} (${raw.length} bytes) — dropped`);
+        if (raw.length > MAX_UPLOAD_BYTES * 2 + 64_000) {
+            console.warn(`[security] Oversized WS message from ${ws.clientIp} (${raw.length} bytes)`);
             return;
         }
 
         let msg;
         try { msg = JSON.parse(raw); } catch { return; }
 
-        // --- Payload Validation & Sanitation ---
         try {
             if (!msg || typeof msg.type !== 'string') return;
 
@@ -1141,33 +1215,31 @@ wss.on('connection', async (ws) => {
                 msg.deltaY = Math.max(-5000, Math.min(5000, msg.deltaY));
             } else if (msg.type === 'keydown' || msg.type === 'keyup') {
                 if (typeof msg.key !== 'string' || msg.key.length > 50) return;
-                if (msg.modifiers && (!Array.isArray(msg.modifiers) || msg.modifiers.some(m => typeof m !== 'string' || m.length > 20))) return;
-            } else if (msg.type === 'goto') {
-                if (typeof msg.url !== 'string' || msg.url.length > 2048) return;
+                if (msg.modifiers && (!Array.isArray(msg.modifiers) || msg.modifiers.some((m) => typeof m !== 'string' || m.length > 20))) return;
+            } else if (msg.type === 'goto' || msg.type === 'new_tab') {
+                if (msg.url && (typeof msg.url !== 'string' || msg.url.length > 2048)) return;
             } else if (msg.type === 'type') {
                 if (typeof msg.text !== 'string' || msg.text.length > 10000) return;
-            } else if (msg.type === 'new_tab') {
-                if (msg.url && (typeof msg.url !== 'string' || msg.url.length > 2048)) return;
             } else if (msg.type === 'switch_tab' || msg.type === 'close_tab') {
                 if (typeof msg.tabId !== 'string' || !/^tab_\d+$/.test(msg.tabId)) return;
-            } else if (msg.type === 'toggle_adblocker') {
+            } else if (msg.type === 'toggle_adblocker' || msg.type === 'toggle_vpn') {
                 if (typeof msg.enabled !== 'boolean') return;
+            } else if (msg.type === 'set_mute') {
+                if (typeof msg.muted !== 'boolean') return;
             } else if (msg.type === 'set_useragent') {
                 if (typeof msg.userAgent !== 'string' || msg.userAgent.length > 512) return;
             } else if (msg.type === 'set_stream_quality') {
                 if (typeof msg.format !== 'string' || !['png', 'jpeg'].includes(msg.format)) return;
-                if (msg.quality !== undefined && typeof msg.quality !== 'number') return;
-            } else if (msg.type === 'toggle_vpn') {
-                if (typeof msg.enabled !== 'boolean') return;
+                if (msg.quality !== undefined && (typeof msg.quality !== 'number' || msg.quality < 10 || msg.quality > 100)) return;
             } else if (msg.type === 'set_zoom') {
                 if (typeof msg.zoom !== 'number' || msg.zoom < 0.2 || msg.zoom > 5.0) return;
             } else if (msg.type === 'file_uploaded') {
                 if (typeof msg.name !== 'string' || msg.name.length > 255) return;
-                if (typeof msg.data !== 'string' || msg.data.length > 200_000_000) return;
+                if (typeof msg.data !== 'string') return;
+                const approxBytes = Math.ceil(msg.data.length * 0.75);
+                if (approxBytes > MAX_UPLOAD_BYTES) return;
             } else if (msg.type === 'set_proxy') {
                 if (typeof msg.proxy !== 'string' || msg.proxy.length > 512) return;
-            } else if (msg.type === 'set_mute') {
-                if (typeof msg.muted !== 'boolean') return;
             } else if (msg.type === 'find') {
                 if (typeof msg.query !== 'string' || msg.query.length > 512) return;
             } else if (msg.type === 'find_next') {
@@ -1175,6 +1247,16 @@ wss.on('connection', async (ws) => {
             }
         } catch {
             return;
+        }
+
+        // Refresh session activity
+        if (ws.tokenHash) {
+            const meta = validTokens.get(ws.tokenHash);
+            if (!isTokenValid(meta)) {
+                ws.close(4001, 'Session expired');
+                return;
+            }
+            touchToken(meta);
         }
 
         try {
@@ -1194,83 +1276,68 @@ wss.on('connection', async (ws) => {
 
             if (msg.type === 'new_tab') {
                 const id = await createTab(ws);
+                if (!id) return;
                 await switchTab(ws, id);
                 const p = ws.tabs.get(id).page;
-                p.goto(msg.url || 'https://www.google.com').catch(e => {
-                    console.warn(`[nav] ${e.message}`);
-                    renderErrorPage(p, msg.url || 'https://www.google.com', e.message);
-                });
+                let target = msg.url || 'https://www.google.com';
+                try {
+                    if (!/^https?:\/\//i.test(target)) target = 'https://' + target;
+                    target = assertSafeNavigationUrl(target);
+                    p.goto(target).catch((e) => renderErrorPage(p, target, e.message));
+                } catch (e) {
+                    renderErrorPage(p, msg.url || target, e.message);
+                }
                 return;
             }
             if (msg.type === 'switch_tab') { await switchTab(ws, msg.tabId); return; }
-            if (msg.type === 'close_tab')  { await closeTab(ws, msg.tabId);  return; }
+            if (msg.type === 'close_tab') { await closeTab(ws, msg.tabId); return; }
 
-            // Session Settings handlers
             if (msg.type === 'clear_session') {
                 if (ws.context) {
                     await ws.context.clearCookies().catch(() => {});
-                    for (const tab of ws.tabs.values()) {
-                        tab.page.reload().catch(() => {});
-                    }
-                    console.log('[session] Cleared all session cookies and reloaded pages.');
+                    for (const tab of ws.tabs.values()) tab.page.reload().catch(() => {});
                 }
                 return;
             }
 
             if (msg.type === 'toggle_adblocker') {
-                ws.adblockerEnabled = msg.enabled;
+                ws.adblockerEnabled = !!msg.enabled;
                 if (adblocker) {
                     for (const tab of ws.tabs.values()) {
-                        if (msg.enabled) {
-                            await adblocker.enableBlockingInPage(tab.page).catch(() => {});
-                        } else {
-                            await adblocker.disableBlockingInPage(tab.page).catch(() => {});
-                        }
+                        if (msg.enabled) await adblocker.enableBlockingInPage(tab.page).catch(() => {});
+                        else await adblocker.disableBlockingInPage(tab.page).catch(() => {});
                     }
                 }
-                console.log(`[session] Adblocker state toggled to: ${msg.enabled}`);
                 return;
             }
 
             if (msg.type === 'set_useragent') {
-                const profiles = {
-                    desktop: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                    mobile: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1'
-                };
-                const targetUA = profiles[msg.userAgent] || msg.userAgent;
+                const profiles = { desktop: DEFAULT_UA, mobile: MOBILE_UA };
+                const key = msg.userAgent;
+                const targetUA = profiles[key] || key;
                 ws.currentUserAgent = targetUA;
-
-                for (const tab of ws.tabs.values()) {
-                    await tab.page.evaluate((ua) => {
-                        window.__customUA = ua;
-                    }, targetUA).catch(() => {});
-                    tab.page.reload().catch(() => {});
-                }
-                console.log(`[session] User-Agent updated to: ${targetUA}`);
+                ws.isMobileUa = key === 'mobile' || /iPhone|Android|Mobile/i.test(targetUA);
+                const currentUrl = (ws.activeTabId && ws.tabs.get(ws.activeTabId)?.url) || 'https://www.google.com';
+                await recreateSessionBrowser(ws, currentUrl);
                 return;
             }
 
             if (msg.type === 'set_stream_quality') {
                 ws.streamFormat = msg.format;
-                ws.streamQuality = msg.quality || 90;
+                ws.streamQuality = typeof msg.quality === 'number' ? msg.quality : 80;
                 if (ws.activeTabId && ws.tabs.has(ws.activeTabId)) {
                     const t = ws.tabs.get(ws.activeTabId);
                     await stopScreencast(t.client);
                     await startScreencast(t.client, ws);
                 }
-                console.log(`[session] Stream quality updated to: ${msg.format} (quality: ${msg.quality || 'N/A'})`);
                 return;
             }
 
             if (msg.type === 'toggle_vpn') {
-                ws.vpnEnabled = msg.enabled;
-                console.log(`[vpn] WARP VPN toggle: ${msg.enabled}`);
+                ws.vpnEnabled = !!msg.enabled;
+                ws.proxyServer = null;
                 try {
-                    await initBrowserContext(ws);
-                    const tabId = await createTab(ws);
-                    await switchTab(ws, tabId);
-                    const p = ws.tabs.get(tabId).page;
-                    p.goto('https://www.google.com').catch(e => console.warn(`[nav] ${e.message}`));
+                    await recreateSessionBrowser(ws, 'https://www.google.com');
                 } catch (err) {
                     console.error('[!] Failed to toggle VPN context:', err.message);
                 }
@@ -1282,32 +1349,27 @@ wss.on('connection', async (ws) => {
                 if (ws.activeTabId && ws.tabs.has(ws.activeTabId)) {
                     const page = ws.tabs.get(ws.activeTabId).page;
                     await page.evaluate((zoom) => {
-                        document.body.style.zoom = zoom;
+                        if (document.body) document.body.style.zoom = zoom;
                     }, msg.zoom).catch(() => {});
                 }
-                console.log(`[session] Zoom set to: ${msg.zoom * 100}%`);
                 return;
             }
 
             if (msg.type === 'file_uploaded') {
-                if (ws.activeFileChooser) {
-                    try {
-                        const safeName = path.basename(msg.name).replace(/[^a-zA-Z0-9._-]/g, '_');
-                        const buffer = Buffer.from(msg.data, 'base64');
-                        const tempPath = path.join(downloadsDir, 'upload_' + Date.now() + '_' + safeName);
-                        await fs.promises.writeFile(tempPath, buffer);
-                        console.log(`[upload] Saved local upload to temp file: ${tempPath}`);
-                        await ws.activeFileChooser.setFiles(tempPath);
-                        // Clean up the temp file after Playwright consumes it
-                        setTimeout(async () => {
-                            await fs.promises.unlink(tempPath).catch(() => {});
-                        }, 5000);
-                        ws.activeFileChooser = null;
-                    } catch (err) {
-                        console.error('[upload] Failed to process upload:', err.message);
-                    }
-                } else {
-                    console.warn('[upload] Received upload data but no active file chooser was open');
+                if (!ws.activeFileChooser) return;
+                try {
+                    const safeName = sanitizeDownloadName(msg.name);
+                    const buffer = Buffer.from(msg.data, 'base64');
+                    if (buffer.length > MAX_UPLOAD_BYTES) return;
+                    const tempPath = path.join(downloadsDir, `upload_${Date.now()}_${safeName}`);
+                    const resolved = path.resolve(tempPath);
+                    if (!resolved.startsWith(path.resolve(downloadsDir) + path.sep)) return;
+                    await fs.promises.writeFile(resolved, buffer);
+                    await ws.activeFileChooser.setFiles(resolved);
+                    setTimeout(() => fs.promises.unlink(resolved).catch(() => {}), 5000);
+                    ws.activeFileChooser = null;
+                } catch (err) {
+                    console.error('[upload] Failed:', err.message);
                 }
                 return;
             }
@@ -1316,7 +1378,6 @@ wss.on('connection', async (ws) => {
             const p = ws.tabs.get(ws.activeTabId).page;
             if (p.isClosed()) return;
 
-            // -- Proxy reconfiguration (fast, no Tor - instant context swap) --
             if (msg.type === 'set_proxy') {
                 const proxyStr = (msg.proxy || '').trim();
                 if (proxyStr && !/^(socks[45]|https?):\/\//i.test(proxyStr)) {
@@ -1324,78 +1385,114 @@ wss.on('connection', async (ws) => {
                     return;
                 }
                 ws.proxyServer = proxyStr || null;
-                ws.vpnEnabled = false; // proxy replaces vpn
+                ws.vpnEnabled = false;
                 try {
                     const currentUrl = p.url();
-                    await initBrowserContext(ws);
-                    const tabId = await createTab(ws);
-                    await switchTab(ws, tabId);
-                    if (currentUrl && currentUrl !== 'about:blank') {
-                        ws.tabs.get(tabId).page.goto(currentUrl).catch(() => {});
-                    }
+                    await recreateSessionBrowser(ws, currentUrl && currentUrl !== 'about:blank' ? currentUrl : 'https://www.google.com');
                 } catch (err) {
                     console.error('[!] Failed to apply proxy:', err.message);
                 }
                 return;
             }
 
-            // -- Mute / Unmute via CDP --
             if (msg.type === 'set_mute') {
-                const tab = ws.tabs.get(ws.activeTabId);
-                if (tab && tab.client) {
-                    await tab.client.send('Emulation.setMediaOverridesEnabled', {
-                        media: msg.muted ? 'screen' : 'screen'
-                    }).catch(() => {});
-                    // Best-effort mute via page evaluate
-                    await p.evaluate((muted) => {
-                        document.querySelectorAll('video, audio').forEach(el => { el.muted = muted; });
-                    }, msg.muted).catch(() => {});
-                }
+                ws.isMuted = !!msg.muted;
+                await p.evaluate((muted) => {
+                    document.querySelectorAll('video, audio').forEach((el) => { el.muted = muted; });
+                }, ws.isMuted).catch(() => {});
                 return;
             }
 
-            // -- Find in page --
             if (msg.type === 'find') {
                 const tab = ws.tabs.get(ws.activeTabId);
-                if (tab && tab.client) {
-                    if (msg.query) {
-                        const result = await tab.client.send('Page.findText', {
-                            text: msg.query, caseSensitive: false, searchInUserValue: false
-                        }).catch(() => null);
-                        if (result && ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({ type: 'find_result', count: result.matchCount || 0 }));
-                        }
-                    } else {
-                        await tab.client.send('Page.stopFinding', { action: 'clearSelection' }).catch(() => {});
+                if (!tab?.client) return;
+                try {
+                    if (tab.searchId) {
+                        await tab.client.send('DOM.discardSearchResults', { searchId: tab.searchId }).catch(() => {});
+                        tab.searchId = null;
                     }
+                    if (msg.query) {
+                        const result = await tab.client.send('DOM.performSearch', {
+                            query: msg.query,
+                            includeUserAgentShadowDOM: true
+                        });
+                        tab.searchId = result.searchId;
+                        tab.searchCount = result.resultCount || 0;
+                        tab.searchIndex = 0;
+                        if (ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ type: 'find_result', count: tab.searchCount }));
+                        }
+                        if (tab.searchCount > 0) {
+                            const matches = await tab.client.send('DOM.getSearchResults', {
+                                searchId: result.searchId,
+                                fromIndex: 0,
+                                toIndex: 1
+                            });
+                            if (matches.nodeIds?.[0]) {
+                                await tab.client.send('DOM.scrollIntoViewIfNeeded', { nodeId: matches.nodeIds[0] }).catch(() => {});
+                                await tab.client.send('DOM.highlightNode', {
+                                    nodeId: matches.nodeIds[0],
+                                    highlightConfig: {
+                                        borderColor: { r: 255, g: 100, b: 0, a: 1 },
+                                        contentColor: { r: 255, g: 200, b: 0, a: 0.25 }
+                                    }
+                                }).catch(() => {});
+                            }
+                        }
+                    } else if (ws.readyState === WebSocket.OPEN) {
+                        tab.searchCount = 0;
+                        tab.searchIndex = 0;
+                        ws.send(JSON.stringify({ type: 'find_result', count: 0 }));
+                    }
+                } catch (err) {
+                    console.warn('[find]', err.message);
                 }
                 return;
             }
 
             if (msg.type === 'find_next') {
                 const tab = ws.tabs.get(ws.activeTabId);
-                if (tab && tab.client) {
-                    await tab.client.send('Page.findNext', { forward: msg.forward }).catch(() => {});
+                if (!tab?.client || !tab.searchId) return;
+                try {
+                    const n = tab.searchCount || 0;
+                    if (n <= 0) return;
+                    tab.searchIndex = typeof tab.searchIndex === 'number' ? tab.searchIndex : 0;
+                    tab.searchIndex = msg.forward
+                        ? (tab.searchIndex + 1) % n
+                        : (tab.searchIndex - 1 + n) % n;
+                    const matches = await tab.client.send('DOM.getSearchResults', {
+                        searchId: tab.searchId,
+                        fromIndex: tab.searchIndex,
+                        toIndex: tab.searchIndex + 1
+                    });
+                    if (matches.nodeIds?.[0]) {
+                        await tab.client.send('DOM.scrollIntoViewIfNeeded', { nodeId: matches.nodeIds[0] }).catch(() => {});
+                        await tab.client.send('DOM.highlightNode', {
+                            nodeId: matches.nodeIds[0],
+                            highlightConfig: {
+                                borderColor: { r: 255, g: 100, b: 0, a: 1 },
+                                contentColor: { r: 255, g: 200, b: 0, a: 0.25 }
+                            }
+                        }).catch(() => {});
+                    }
+                } catch (err) {
+                    console.warn('[find_next]', err.message);
                 }
                 return;
             }
-
 
             switch (msg.type) {
                 case 'mousemove':
                     p.mouse.move(msg.x, msg.y).catch(() => {});
                     break;
                 case 'mousedown':
-                    console.log(`[ws] Click down at (${msg.x}, ${msg.y}) button: ${msg.button}`);
                     p.mouse.move(msg.x, msg.y).catch(() => {});
                     p.mouse.down({ button: msg.button || 'left' }).catch(() => {});
                     break;
                 case 'mouseup':
-                    console.log(`[ws] Click up at (${msg.x}, ${msg.y}) button: ${msg.button}`);
                     p.mouse.move(msg.x, msg.y).catch(() => {});
                     p.mouse.up({ button: msg.button || 'left' }).catch(() => {});
                     break;
-
                 case 'keydown': {
                     if (msg.modifiers?.length) {
                         for (const mod of msg.modifiers) {
@@ -1414,65 +1511,60 @@ wss.on('connection', async (ws) => {
                     }
                     break;
                 }
-
                 case 'wheel':
                     p.mouse.wheel(msg.deltaX || 0, msg.deltaY || 0).catch(() => {});
                     break;
-
                 case 'goto': {
                     if (!msg.url) break;
                     let target = msg.url.trim();
-                    console.log(`[ws] URL request: "${target}"`);
-                    
                     let isAutoprepended = false;
                     if (!/^https?:\/\//i.test(target)) {
                         const looksLikeIp = /^(\d{1,3}\.){3}\d{1,3}(:\d+)?(\/.*)?$/.test(target);
                         const looksLikeDomain = looksLikeIp
-                            || /^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(:\d+)?(\/.*)?$/.test(target)
-                            || target.toLowerCase().startsWith('localhost')
-                            || target.startsWith('127.0.0.1');
+                            || /^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(:\d+)?(\/.*)?$/.test(target);
 
                         if (looksLikeDomain) {
-                            const useHttp = looksLikeIp 
-                                || target.toLowerCase().startsWith('localhost') 
-                                || target.startsWith('127.0.0.1');
-                            target = (useHttp ? 'http://' : 'https://') + target;
-                            isAutoprepended = !useHttp;
+                            target = 'https://' + target;
+                            isAutoprepended = true;
                         } else {
                             target = 'https://www.google.com/search?q=' + encodeURIComponent(target);
                         }
                     }
-                    console.log(`[ws] Final resolved navigation target: "${target}"`);
-                    
+
+                    try {
+                        target = assertSafeNavigationUrl(target);
+                    } catch (e) {
+                        await renderErrorPage(p, msg.url, e.message);
+                        break;
+                    }
+
                     const activePage = p;
                     activePage.goto(target).catch(async (e) => {
                         console.warn(`[nav] ${e.message}`);
                         if (isAutoprepended && target.startsWith('https://')) {
-                            const fallbackUrl = target.replace('https://', 'http://');
-                            console.log(`[ws] HTTPS failed, trying HTTP fallback: "${fallbackUrl}"`);
-                            await activePage.goto(fallbackUrl).catch(err => {
-                                console.warn(`[nav fallback] ${err.message}`);
-                                renderErrorPage(activePage, target, err.message);
-                            });
+                            try {
+                                const fallbackUrl = assertSafeNavigationUrl(target.replace(/^https:/, 'http:'));
+                                await activePage.goto(fallbackUrl).catch(async (err) => {
+                                    await renderErrorPage(activePage, target, err.message);
+                                });
+                            } catch (err) {
+                                await renderErrorPage(activePage, target, err.message);
+                            }
                         } else {
-                            renderErrorPage(activePage, target, e.message);
+                            await renderErrorPage(activePage, target, e.message);
                         }
                     });
                     break;
                 }
-
                 case 'type':
                     p.keyboard.type(msg.text).catch(() => {});
                     break;
-
                 case 'back':
                     p.goBack().catch(() => {});
                     break;
-
                 case 'forward':
                     p.goForward().catch(() => {});
                     break;
-
                 case 'reload':
                     p.reload().catch(() => {});
                     break;
@@ -1483,15 +1575,13 @@ wss.on('connection', async (ws) => {
     });
 
     ws.on('close', async () => {
-        console.log('[-] Client disconnected');
+        activeSockets.delete(ws);
+        console.log(`[-] Client disconnected (${activeSockets.size} active)`);
         if (ws.ackTimeout) {
             clearTimeout(ws.ackTimeout);
             ws.ackTimeout = null;
         }
-        // Close browser context associated with this client to clear memory, history, cookies, and localstorage
-        if (ws.context) {
-            await ws.context.close().catch(() => {});
-        }
+        if (ws.context) await ws.context.close().catch(() => {});
     });
 
     ws.on('error', (err) => {
