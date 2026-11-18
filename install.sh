@@ -1,78 +1,81 @@
 #!/bin/bash
 set -euo pipefail
 
-echo "==================================================="
-echo "  Virtual Browser - Quick Install for Debian       "
-echo "==================================================="
+echo "=========================================================="
+echo "  MSuite-Browser: Debian 13 Virtual Browser - Quick Install"
+echo "=========================================================="
 
 # Guard: if this file was saved from a GitHub 404 (private/raw URL without auth), abort early.
-if ! head -1 "$0" | grep -q '^#!/bin/bash'; then
+if ! head -1 "$0" 2>/dev/null | grep -q '^#!/bin/bash'; then
     echo "[!] This install.sh does not look like a valid script."
-    echo "    If you used wget/curl against raw.githubusercontent.com and the repo is"
-    echo "    private, you likely saved a '404: Not Found' body. Clone with git auth instead:"
-    echo "      git clone https://github.com/merlinthedev848/browser.git virtual-browser"
-    echo "      cd virtual-browser && ./install.sh"
+    echo "    If you used wget/curl against raw.githubusercontent.com and encountered an issue,"
+    echo "    clone with git instead:"
+    echo "      git clone https://github.com/merlinthedev848/MSuite-Browser.git"
+    echo "      cd MSuite-Browser && ./install.sh"
     exit 1
 fi
 
-# 1. Install system dependencies
-echo "[*] Installing required system packages (Git & Docker)..."
-sudo apt-get update -y -q
-sudo apt-get install -y git docker.io curl
+# 1. Install system dependencies (Debian 13 Trixie / Debian 12 Bookworm)
+echo "[*] Ensuring required system packages are installed..."
+if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update -y -q
+    sudo apt-get install -y git docker.io curl ca-certificates
+fi
 
-# Ensure Docker is enabled and running
-sudo systemctl enable --now docker
+# Ensure Docker service is enabled and running
+if command -v systemctl >/dev/null 2>&1; then
+    sudo systemctl enable --now docker 2>/dev/null || true
+fi
 
 # 2. Clone or update the repository
-REPO_URL="https://github.com/merlinthedev848/browser.git"
-INSTALL_DIR="virtual-browser"
+REPO_URL="https://github.com/merlinthedev848/MSuite-Browser.git"
+INSTALL_DIR="MSuite-Browser"
 
-# If we are already inside a clone of this repo, update in place instead of nesting
+# If already inside a checkout of this repo, update in place
 if [ -f "./server.js" ] && [ -f "./Dockerfile" ] && [ -d "./.git" ]; then
-    echo "[*] Running from an existing repo checkout — updating this directory..."
-    git fetch origin main
-    git reset --hard origin/main
+    echo "[*] Running from existing checkout — updating working copy..."
+    git fetch origin main 2>/dev/null || true
+    git reset --hard origin/main 2>/dev/null || true
     INSTALL_DIR="."
 fi
 
 if [ "$INSTALL_DIR" != "." ]; then
     if [ -d "$INSTALL_DIR/.git" ]; then
-        echo "[*] Existing installation found — updating to latest version..."
+        echo "[*] Existing installation directory found — updating..."
         cd "$INSTALL_DIR"
         git fetch origin main
         git reset --hard origin/main
     else
-        echo "[*] Cloning the Virtual Browser repository..."
+        echo "[*] Cloning MSuite-Browser repository..."
         if ! git clone "$REPO_URL" "$INSTALL_DIR"; then
-            echo "[!] git clone failed. If the repo is private, authenticate first, e.g.:"
-            echo "    git clone https://<TOKEN>@github.com/merlinthedev848/browser.git $INSTALL_DIR"
+            echo "[!] git clone failed. Check repository permissions or network connection."
             exit 1
         fi
         cd "$INSTALL_DIR"
     fi
 fi
 
-# 3. Ensure persistent data directory exists
-echo "[*] Setting up persistent storage..."
-mkdir -p browser_data
+# 3. Ensure persistent data directory exists with restricted permissions
+echo "[*] Configuring persistent storage (browser_data)..."
+mkdir -p browser_data/downloads
 chmod 700 browser_data
 
-# 4. Ask for password (required — no insecure default)
+# 4. Password validation (require 8+ chars, forbid insecure defaults)
 echo ""
 EXISTING_PASSWORD=""
 if sudo docker ps -a --format '{{.Names}}' | grep -q "^vbrowser$"; then
     EXISTING_PASSWORD=$(sudo docker inspect --format='{{range .Config.Env}}{{if eq (slice . 0 9) "PASSWORD="}}{{slice . 9}}{{end}}{{end}}' vbrowser 2>/dev/null || true)
+elif sudo docker ps -a --format '{{.Names}}' | grep -q "^msuite-browser$"; then
+    EXISTING_PASSWORD=$(sudo docker inspect --format='{{range .Config.Env}}{{if eq (slice . 0 9) "PASSWORD="}}{{slice . 9}}{{end}}{{end}}' msuite-browser 2>/dev/null || true)
 fi
 
-if [ -n "$EXISTING_PASSWORD" ] && [ "$EXISTING_PASSWORD" != "password123" ]; then
+if [ -n "$EXISTING_PASSWORD" ] && [ "$EXISTING_PASSWORD" != "password123" ] && [ "${#EXISTING_PASSWORD}" -ge 8 ]; then
     USER_PASSWORD="$EXISTING_PASSWORD"
-    echo "[*] Reusing existing password from running container."
+    echo "[*] Reusing existing secure password from running container."
 else
-    echo "Enter a secure password for your Virtual Browser (min 8 characters)."
-    echo "A blank password is not allowed."
-
+    echo "Enter a secure password for your Virtual Browser (minimum 8 characters)."
     if [ -t 0 ]; then
-        read -s -r USER_PASSWORD
+        read -s -r -p "Password: " USER_PASSWORD
         echo ""
     else
         read -s -r USER_PASSWORD </dev/tty 2>/dev/null || USER_PASSWORD=""
@@ -80,58 +83,61 @@ else
     fi
 
     if [ -z "$USER_PASSWORD" ] || [ "$USER_PASSWORD" = "password123" ] || [ "${#USER_PASSWORD}" -lt 8 ]; then
-        echo "[!] Invalid password. Generate one with: openssl rand -base64 18"
+        echo "[!] Invalid password. Password must be at least 8 characters and not 'password123'."
+        echo "    Tip: Generate a strong password with: openssl rand -base64 16"
         exit 1
     fi
 fi
 
 # 5. Build Docker image
 echo ""
-echo "[*] Building Docker image (this may take a few minutes on first run)..."
-sudo docker build -t virtual-browser .
+echo "[*] Building MSuite-Browser Docker image..."
+sudo docker build -t msuite-browser .
 
-# 6. Stop and remove any existing container
-if sudo docker ps -a --format '{{.Names}}' | grep -q "^vbrowser$"; then
-    echo "[*] Removing existing container..."
-    sudo docker rm -f vbrowser
-fi
+# 6. Stop and remove legacy or existing containers
+for c in vbrowser msuite-browser; do
+    if sudo docker ps -a --format '{{.Names}}' | grep -q "^${c}$"; then
+        echo "[*] Stopping existing container: ${c}..."
+        sudo docker rm -f "${c}" >/dev/null 2>&1 || true
+    fi
+done
 
-# 7. Start the container
+# 7. Start container
 echo ""
-echo "[*] Starting the Virtual Browser container..."
+echo "[*] Starting MSuite-Browser container..."
 sudo docker run -d \
-    --name vbrowser \
+    --name msuite-browser \
     -p 3000:3000 \
     -e PASSWORD="$USER_PASSWORD" \
     -e TRUST_PROXY=0 \
     -v "$(pwd)/browser_data:/usr/src/app/browser_data" \
-    --shm-size 1g \
+    --shm-size 2g \
     --restart unless-stopped \
-    virtual-browser
+    msuite-browser
 
-# 8. Wait briefly and confirm the container started
+# 8. Verification & Status Check
 sleep 3
-if sudo docker ps --format '{{.Names}}' | grep -q "^vbrowser$"; then
+if sudo docker ps --format '{{.Names}}' | grep -q "^msuite-browser$"; then
     echo ""
-    echo "==================================================="
-    echo "  INSTALLATION COMPLETE!                           "
-    echo "==================================================="
+    echo "=========================================================="
+    echo "  INSTALLATION COMPLETE!                                  "
+    echo "=========================================================="
     echo ""
-    echo "  Container: vbrowser (running)"
-    echo "  Port:      3000"
-    echo "  Password:  (set — not printed)"
+    echo "  Container: msuite-browser (healthy and running)"
+    echo "  Web Port:  http://localhost:3000"
+    echo "  Password:  (configured)"
     echo ""
-    echo "  Put this behind Nginx/Caddy with HTTPS + WebSocket"
-    echo "  upgrade headers for production use:"
+    echo "  For production, deploy behind Nginx or Caddy with TLS"
+    echo "  and WebSocket upgrade headers, then pass TRUST_PROXY=1:"
     echo "    proxy_http_version 1.1;"
     echo "    proxy_set_header Upgrade \$http_upgrade;"
     echo "    proxy_set_header Connection \"upgrade\";"
     echo "    proxy_set_header X-Forwarded-Proto \$scheme;"
-    echo "  Then set TRUST_PROXY=1 on the container."
-    echo "==================================================="
+    echo "    proxy_set_header X-Forwarded-Host \$host;"
+    echo "=========================================================="
 else
     echo ""
-    echo "[!] Container failed to start. Check logs with:"
-    echo "    docker logs vbrowser"
+    echo "[!] Container failed to start. Review logs with:"
+    echo "    sudo docker logs msuite-browser"
     exit 1
 fi

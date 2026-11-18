@@ -2,10 +2,10 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Secure Virtual Browser</title>
-    <meta name="description" content="A secure, remotely-hosted virtual browser session.">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>MSuite-Browser - Remote Browser Isolation</title>
+    <meta name="description" content="Secure, remotely-isolated virtual browser powered by Debian and Playwright.">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -13,11 +13,11 @@
     <div id="login-screen" class="login-container">
         <div class="login-card">
             <div class="login-header">
-                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--accent-color)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shield-icon" aria-hidden="true">
+                <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="var(--accent-color)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shield-icon" aria-hidden="true">
                     <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
                 </svg>
-                <h2>Secure Session</h2>
-                <p>Enter your password to access the remote browser.</p>
+                <h2>MSuite-Browser</h2>
+                <p>Enter your session password to connect to the isolated virtual browser.</p>
             </div>
             <form id="login-form" autocomplete="on">
                 <input type="text" name="username" value="admin" autocomplete="username" style="display:none;" aria-hidden="true" tabindex="-1" />
@@ -26,9 +26,9 @@
                         <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
                         <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
                     </svg>
-                    <input type="password" id="password-input" placeholder="Password" required autocomplete="current-password" />
+                    <input type="password" id="password-input" placeholder="Enter session password" required autocomplete="current-password" autofocus />
                 </div>
-                <div id="login-error" class="error-msg hidden" role="alert"></div>
+                <div id="login-error" class="error-msg hidden" role="alert" aria-live="assertive"></div>
                 <button type="submit" id="login-btn">
                     <span>Connect</span>
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -41,39 +41,39 @@
     </div>
 
     <!-- Main Browser UI -->
-    <div id="app-container" class="app-container hidden" aria-label="Remote browser">
-        <!-- Tab Bar (Windows Style: Top of Window) -->
+    <div id="app-container" class="app-container hidden" aria-label="Remote browser session">
+        <!-- Tab Bar -->
         <div class="tab-bar" role="tablist" aria-label="Browser tabs">
             <div class="tabs-container" id="tabs-container">
-                <!-- Tabs injected dynamically -->
+                <!-- Injected dynamically -->
             </div>
-            <button id="new-tab-btn" class="new-tab-btn" title="New Tab" aria-label="Open new tab">
+            <button id="new-tab-btn" class="new-tab-btn" title="New Tab (Ctrl+T)" aria-label="Open new tab">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                     <line x1="12" y1="5" x2="12" y2="19"></line>
                     <line x1="5" y1="12" x2="19" y2="12"></line>
                 </svg>
             </button>
-            <div class="window-controls-win" aria-hidden="true">
-                <button class="win-btn win-minimize" tabindex="-1" title="Minimize">—</button>
-                <button class="win-btn win-maximize" tabindex="-1" title="Maximize">▢</button>
-                <button class="win-btn win-close" tabindex="-1" title="Close">✕</button>
+            <div class="window-controls-win" aria-label="Window management">
+                <button class="win-btn win-minimize" title="Lock / Return to Login" aria-label="Minimize or lock browser session">—</button>
+                <button class="win-btn win-maximize" title="Toggle Fullscreen" aria-label="Toggle fullscreen mode">▢</button>
+                <button class="win-btn win-close" title="Disconnect Session" aria-label="Close and disconnect session">✕</button>
             </div>
         </div>
 
-        <!-- Toolbar (Windows Style: Below Tab Bar) -->
+        <!-- Toolbar -->
         <header class="toolbar">
             <div class="nav-buttons">
-                <button id="back-btn" class="nav-btn" aria-label="Go Back" title="Back">
+                <button id="back-btn" class="nav-btn" aria-label="Go Back" title="Back (Alt+Left)">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                         <polyline points="15 18 9 12 15 6"></polyline>
                     </svg>
                 </button>
-                <button id="forward-btn" class="nav-btn" aria-label="Go Forward" title="Forward">
+                <button id="forward-btn" class="nav-btn" aria-label="Go Forward" title="Forward (Alt+Right)">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                         <polyline points="9 18 15 12 9 6"></polyline>
                     </svg>
                 </button>
-                <button id="reload-btn" class="nav-btn" aria-label="Reload Page" title="Reload">
+                <button id="reload-btn" class="nav-btn" aria-label="Reload Page" title="Reload (F5 or Ctrl+R)">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M23 4v6h-6"></path>
                         <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
@@ -85,62 +85,61 @@
                     <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
                     <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
                 </svg>
-                <input type="text" id="url-input" placeholder="Enter URL or search..." autocomplete="off" spellcheck="false" />
-                <button id="go-btn" aria-label="Navigate">
+                <input type="text" id="url-input" placeholder="Search with Google or enter web address..." autocomplete="off" spellcheck="false" aria-label="Address and search bar" />
+                <button id="go-btn" aria-label="Navigate to URL">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                         <line x1="5" y1="12" x2="19" y2="12"></line>
                         <polyline points="12 5 19 12 12 19"></polyline>
                     </svg>
                 </button>
             </div>
-            <div class="status-indicator" id="status-indicator" aria-live="polite">
-                <span class="status-dot disconnected" aria-hidden="true"></span>
-                <span class="status-text">Disconnected</span>
+            <div class="toolbar-tools">
+                <div class="status-indicator" id="status-indicator" aria-live="polite">
+                    <span class="status-dot disconnected" aria-hidden="true"></span>
+                    <span class="status-text">Disconnected</span>
+                </div>
+                <button id="find-btn" class="toolbar-btn" title="Find in Page (Ctrl+F)" aria-label="Find text in page">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                    </svg>
+                </button>
+                <button id="downloads-btn" class="toolbar-btn" title="Downloads" aria-label="Open downloads drawer">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="7 10 12 15 17 10"></polyline>
+                        <line x1="12" y1="15" x2="12" y2="3"></line>
+                    </svg>
+                </button>
+                <button id="mute-btn" class="toolbar-btn" title="Mute Audio" aria-label="Mute remote browser audio">
+                    <svg id="mute-icon-on" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                        <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+                        <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                    </svg>
+                    <svg id="mute-icon-off" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                        <line x1="23" y1="9" x2="17" y2="15"></line>
+                        <line x1="17" y1="9" x2="23" y2="15"></line>
+                    </svg>
+                </button>
+                <button id="clip-btn" class="toolbar-btn" title="Clipboard Sync" aria-label="Open clipboard sync manager">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
+                        <rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect>
+                    </svg>
+                </button>
+                <button id="settings-btn" class="toolbar-btn" title="Session Settings" aria-label="Open settings panel">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                    </svg>
+                </button>
             </div>
-            <!-- Find in page -->
-            <button id="find-btn" class="toolbar-btn" title="Find in Page (Ctrl+F)" aria-label="Find in page">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <circle cx="11" cy="11" r="8"></circle>
-                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-                </svg>
-            </button>
-            <!-- Downloads -->
-            <button id="downloads-btn" class="toolbar-btn" title="Downloads" aria-label="Open downloads panel">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                    <polyline points="7 10 12 15 17 10"></polyline>
-                    <line x1="12" y1="15" x2="12" y2="3"></line>
-                </svg>
-            </button>
-            <!-- Mute -->
-            <button id="mute-btn" class="toolbar-btn" title="Mute Tab" aria-label="Mute remote audio">
-                <svg id="mute-icon-on" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
-                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
-                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
-                </svg>
-                <svg id="mute-icon-off" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none">
-                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
-                    <line x1="23" y1="9" x2="17" y2="15"></line>
-                    <line x1="17" y1="9" x2="23" y2="15"></line>
-                </svg>
-            </button>
-            <button id="clip-btn" class="toolbar-btn" title="Clipboard Sync" aria-label="View synced clipboard">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
-                    <rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect>
-                </svg>
-            </button>
-            <button id="settings-btn" class="toolbar-btn" title="Session Settings" aria-label="Open settings panel">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <circle cx="12" cy="12" r="3"></circle>
-                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                </svg>
-            </button>
         </header>
 
         <!-- Bookmarks Bar -->
-        <div class="bookmarks-bar" id="bookmarks-bar">
+        <div class="bookmarks-bar" id="bookmarks-bar" aria-label="Bookmarks bar">
             <div class="bookmarks-container" id="bookmarks-container">
                 <!-- Bookmarks injected dynamically -->
             </div>
@@ -151,84 +150,95 @@
             </button>
         </div>
 
-        <!-- Browser Display -->
+        <!-- Browser Viewport Area -->
         <main class="browser-viewport">
-            <!-- Progress Bar -->
-            <div class="progress-bar-container">
+            <div class="progress-bar-container" aria-hidden="true">
                 <div id="loading-progress" class="progress-bar"></div>
             </div>
-            <div class="loading-overlay hidden" id="loading-overlay" role="status">
+            <div class="loading-overlay hidden" id="loading-overlay" role="status" aria-live="polite">
                 <div class="spinner" aria-hidden="true"></div>
-                <p id="loading-text">Connecting to browser...</p>
+                <p id="loading-text">Connecting to remote browser...</p>
             </div>
-            <div id="viewport-container" tabindex="0" aria-label="Remote browser display">
-                <img id="screencast-a" class="screencast-viewport" alt="Viewport A" />
-                <img id="screencast-b" class="screencast-viewport" alt="Viewport B" />
+            <div id="viewport-container" tabindex="0" aria-label="Remote browser screen">
+                <img id="screencast-a" class="screencast-viewport" alt="Remote Display Buffer A" />
+                <img id="screencast-b" class="screencast-viewport" alt="Remote Display Buffer B" />
                 <div id="interaction-overlay"></div>
             </div>
         </main>
 
-        <!-- Synced Clipboard Modal -->
-        <div id="clip-modal" class="clip-modal hidden" role="dialog" aria-labelledby="clip-modal-title">
-            <div class="clip-modal-header">
-                <h3 id="clip-modal-title">Clipboard Manager</h3>
-                <button id="clip-close-btn" aria-label="Close clipboard panel">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                </button>
-            </div>
-            <p>Paste text below to push it to the remote browser's keyboard, or copy text retrieved from the remote session:</p>
-            <textarea id="clip-text" placeholder="Type or paste content here..." autocomplete="off" spellcheck="false"></textarea>
-            <div class="clip-modal-actions">
-                <button id="clip-push-btn">Send text to remote cursor</button>
+        <!-- Remote Page Dialog Modal (alert, confirm, prompt) -->
+        <div id="dialog-modal" class="app-modal hidden" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+            <div class="modal-dialog-card">
+                <h3 id="dialog-title">Website Message</h3>
+                <p id="dialog-message" class="dialog-text"></p>
+                <div id="dialog-input-group" class="dialog-input-group hidden">
+                    <input type="text" id="dialog-input" class="modal-input" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="modal-footer-actions">
+                    <button id="dialog-cancel-btn" class="btn-small btn-outline">Cancel</button>
+                    <button id="dialog-ok-btn" class="btn-small">OK</button>
+                </div>
             </div>
         </div>
 
-        <div id="settings-modal" class="settings-modal hidden" role="dialog" aria-labelledby="settings-modal-title">
+        <!-- Clipboard Manager Modal -->
+        <div id="clip-modal" class="clip-modal hidden" role="dialog" aria-modal="true" aria-labelledby="clip-modal-title">
+            <div class="clip-modal-header">
+                <h3 id="clip-modal-title">Clipboard Manager</h3>
+                <button id="clip-close-btn" class="modal-close-btn" aria-label="Close clipboard panel">✕</button>
+            </div>
+            <p>Paste text below to insert it at the remote cursor, or inspect text copied from the remote session:</p>
+            <textarea id="clip-text" placeholder="Type or paste text content here..." autocomplete="off" spellcheck="false"></textarea>
+            <div class="clip-modal-actions">
+                <button id="clip-push-btn" class="btn-small">Insert into Remote Cursor</button>
+            </div>
+        </div>
+
+        <!-- Session Settings Modal -->
+        <div id="settings-modal" class="settings-modal hidden" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title">
             <div class="settings-modal-header">
                 <h3 id="settings-modal-title">⚙️ Session Settings</h3>
-                <button id="settings-close-btn" aria-label="Close settings panel">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                </button>
+                <button id="settings-close-btn" class="modal-close-btn" aria-label="Close settings panel">✕</button>
             </div>
             <div class="settings-body">
                 <p class="settings-section-label">Privacy & Security</p>
                 <div class="settings-group">
                     <label class="toggle-control">
-                        <span>🛡️ Adblocker</span>
+                        <span>🛡️ Ad &amp; Tracker Blocker</span>
                         <input type="checkbox" id="adblock-toggle" checked />
                         <span class="control-indicator"></span>
                     </label>
                 </div>
                 <div class="settings-group proxy-group">
-                    <label for="proxy-input">🌐 Custom Proxy <span class="label-hint">(socks5:// or http://)</span></label>
+                    <label for="proxy-input">🌐 Custom SOCKS5 / HTTP Proxy</label>
                     <div class="proxy-row">
                         <input type="text" id="proxy-input" placeholder="socks5://user:pass@host:port" autocomplete="off" spellcheck="false" />
                         <button id="proxy-apply-btn" class="btn-small">Apply</button>
                         <button id="proxy-clear-btn" class="btn-small btn-outline">Off</button>
                     </div>
-                    <p class="settings-hint">🔒 Routes ALL browser traffic through your own proxy. Supports SOCKS5, SOCKS4, HTTP.</p>
+                    <p class="settings-hint">Routes remote browser traffic through an external proxy endpoint.</p>
                 </div>
                 <div class="settings-group">
                     <label class="toggle-control">
-                        <span>⚡ Free VPN <span class="label-hint">(Cloudflare WARP)</span></span>
+                        <span>⚡ Cloudflare WARP VPN</span>
                         <input type="checkbox" id="vpn-toggle" />
                         <span class="control-indicator"></span>
                     </label>
-                    <p class="settings-hint">Routes traffic through Cloudflare's global network. Fast, free, no account needed. Hides your IP from websites.</p>
+                    <p class="settings-hint">Masks outbound traffic using Cloudflare's userspace WARP network.</p>
                 </div>
 
-                <p class="settings-section-label">User-Agent & Display</p>
+                <p class="settings-section-label">Device Emulation &amp; Display</p>
                 <div class="settings-group">
                     <label for="ua-select">User-Agent Profile</label>
-                    <select id="ua-select">
-                        <option value="desktop">Desktop Chrome (Windows)</option>
-                        <option value="mobile">Mobile Safari (iPhone)</option>
+                    <select id="ua-select" class="modal-select">
+                        <option value="desktop">Desktop Chrome (Windows 1920x1080)</option>
+                        <option value="mobile">Mobile Safari (iPhone 390x844)</option>
                         <option value="custom">Custom User-Agent</option>
                     </select>
-                    <input type="text" id="custom-ua-input" class="hidden" placeholder="Enter custom User-Agent..." autocomplete="off" spellcheck="false" />
+                    <input type="text" id="custom-ua-input" class="hidden modal-input" placeholder="Enter custom User-Agent string..." autocomplete="off" spellcheck="false" style="margin-top: 6px;" />
                 </div>
                 <div class="settings-group">
-                    <label>Page Zoom</label>
+                    <label>Viewport Zoom</label>
                     <div class="zoom-row">
                         <button id="zoom-out-btn" class="btn-small btn-outline">−</button>
                         <span id="zoom-level-display">100%</span>
@@ -237,60 +247,58 @@
                     </div>
                 </div>
                 <div class="settings-group">
-                    <label for="quality-select">Stream Performance</label>
-                    <select id="quality-select">
-                        <option value="jpeg_80" selected>Fast - Balanced (JPEG 80)</option>
-                        <option value="jpeg_90">High Quality (JPEG 90)</option>
-                        <option value="jpeg_98">Crisp (JPEG 98)</option>
-                        <option value="png">Lossless - Pixel-Perfect (PNG)</option>
+                    <label for="quality-select">Screencast Stream Profile</label>
+                    <select id="quality-select" class="modal-select">
+                        <option value="jpeg_80" selected>Balanced (JPEG 80 Quality)</option>
+                        <option value="jpeg_90">High Quality (JPEG 90 Quality)</option>
+                        <option value="jpeg_98">Ultra Crisp (JPEG 98 Quality)</option>
+                        <option value="png">Lossless / Pixel-Perfect (PNG)</option>
                     </select>
                 </div>
 
-                <p class="settings-section-label">Session</p>
+                <p class="settings-section-label">Session Actions</p>
                 <div class="settings-group actions">
-                    <button id="clear-session-btn" class="btn-danger">🗑️ Clear Cookies &amp; Cache</button>
+                    <button id="clear-session-btn" class="btn-danger">🗑️ Clear Site Cookies &amp; Cache</button>
                 </div>
             </div>
         </div>
 
-        <!-- Downloads Panel -->
-        <div id="downloads-panel" class="downloads-panel hidden" role="dialog" aria-label="Downloads">
+        <!-- Downloads Drawer -->
+        <div id="downloads-panel" class="downloads-panel hidden" role="dialog" aria-modal="false" aria-label="Downloads drawer">
             <div class="downloads-header">
                 <span>📥 Downloads</span>
-                <button id="downloads-close-btn">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                </button>
+                <button id="downloads-close-btn" class="modal-close-btn" aria-label="Close downloads">✕</button>
             </div>
             <div id="downloads-list" class="downloads-list">
-                <p class="downloads-empty">No downloads yet.</p>
+                <p class="downloads-empty">No downloads in this session.</p>
             </div>
         </div>
 
-        <!-- File Upload Panel -->
-        <div id="upload-panel" class="upload-panel hidden" role="dialog" aria-label="Upload a file">
+        <!-- File Upload Modal -->
+        <div id="upload-panel" class="upload-panel hidden" role="dialog" aria-modal="true" aria-labelledby="upload-title">
             <div class="upload-header">
-                <span>📤 Upload File</span>
-                <button id="upload-close-btn">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                </button>
+                <span id="upload-title">📤 Upload File to Remote Page</span>
+                <button id="upload-close-btn" class="modal-close-btn" aria-label="Cancel upload">✕</button>
             </div>
-            <p class="upload-hint">The remote page is requesting a file. Select one from your device:</p>
+            <p class="upload-hint">The target website is requesting a file. Select a file from your device:</p>
             <input type="file" id="local-file-input" style="display:none" />
-            <button id="upload-pick-btn" class="btn-small">Choose File...</button>
-            <span id="upload-filename" class="upload-filename">No file chosen</span>
+            <div style="padding: 0 16px 8px; display: flex; align-items: center; gap: 10px;">
+                <button id="upload-pick-btn" class="btn-small btn-outline">Choose File...</button>
+                <span id="upload-filename" class="upload-filename">No file chosen</span>
+            </div>
             <div class="upload-actions">
-                <button id="upload-send-btn" class="btn-small" disabled>Send to Browser</button>
+                <button id="upload-send-btn" class="btn-small" disabled>Submit File</button>
                 <button id="upload-cancel-btn" class="btn-small btn-outline">Cancel</button>
             </div>
         </div>
 
         <!-- Find In Page Bar -->
-        <div id="find-bar" class="find-bar hidden">
+        <div id="find-bar" class="find-bar hidden" role="search" aria-label="Find on page">
             <input type="text" id="find-input" placeholder="Find in page..." autocomplete="off" spellcheck="false" />
             <span id="find-count" class="find-count"></span>
-            <button id="find-prev-btn" class="find-btn" title="Previous">▲</button>
-            <button id="find-next-btn" class="find-btn" title="Next">▼</button>
-            <button id="find-close-btn" class="find-btn" title="Close">✕</button>
+            <button id="find-prev-btn" class="find-btn" title="Previous match (Shift+Enter)">▲</button>
+            <button id="find-next-btn" class="find-btn" title="Next match (Enter)">▼</button>
+            <button id="find-close-btn" class="find-btn" title="Close (Escape)">✕</button>
         </div>
 
         <!-- Custom Context Menu -->

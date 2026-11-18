@@ -1,12 +1,12 @@
-FROM node:20-bookworm
+FROM node:22-bookworm
 
 WORKDIR /usr/src/app
 
-# Reproducible installs when lockfile is present
+# Reproducible dependency installation
 COPY package.json package-lock.json* ./
 RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
 
-# ---- System fonts + curl/gnupg for optional WARP ----
+# ---- System fonts & core utilities ----
 RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     fonts-dejavu \
@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg \
     && rm -rf /var/lib/apt/lists/*
 
-# ---- Optional Cloudflare WARP (amd64 only; skipped on other arches) ----
+# ---- Optional Cloudflare WARP client (amd64) ----
 ARG ENABLE_WARP=1
 RUN set -eux; \
     ARCH="$(dpkg --print-architecture)"; \
@@ -26,18 +26,21 @@ RUN set -eux; \
         | gpg --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg; \
       echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ bookworm main" \
         > /etc/apt/sources.list.d/cloudflare-client.list; \
-      apt-get update && apt-get install -y --no-install-recommends cloudflare-warp; \
+      apt-get update && apt-get install -y --no-install-recommends cloudflare-warp || echo "WARP package install skipped"; \
       rm -rf /var/lib/apt/lists/*; \
     else \
       echo "WARP install skipped (ENABLE_WARP=$ENABLE_WARP arch=$ARCH)"; \
     fi
 
-# ---- Playwright Google Chrome (proprietary codecs) ----
+# ---- Playwright Google Chrome with system dependencies ----
 RUN npx playwright install chrome --with-deps
 
+# Copy application files
 COPY . .
+
+# Normalize line endings and set permissions
 RUN sed -i 's/\r$//' /usr/src/app/entrypoint.sh && chmod +x /usr/src/app/entrypoint.sh \
-    && mkdir -p /usr/src/app/browser_data /usr/src/app/adblocker_cache
+    && mkdir -p /usr/src/app/browser_data/downloads /usr/src/app/adblocker_cache
 
 ENV NODE_ENV=production
 EXPOSE 3000

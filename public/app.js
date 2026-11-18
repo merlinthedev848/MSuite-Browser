@@ -1,31 +1,34 @@
 // ---------- DOM References ----------
-const loginScreen      = document.getElementById('login-screen');
-const loginForm        = document.getElementById('login-form');
-const passwordInput    = document.getElementById('password-input');
-const loginError       = document.getElementById('login-error');
-const loginBtn         = document.getElementById('login-btn');
-const appContainer     = document.getElementById('app-container');
+const loginScreen       = document.getElementById('login-screen');
+const loginForm         = document.getElementById('login-form');
+const passwordInput     = document.getElementById('password-input');
+const loginError        = document.getElementById('login-error');
+const loginBtn          = document.getElementById('login-btn');
+const appContainer      = document.getElementById('app-container');
 const viewportContainer = document.getElementById('viewport-container');
-const imgA             = document.getElementById('screencast-a');
-const imgB             = document.getElementById('screencast-b');
-const overlay          = document.getElementById('interaction-overlay');
-const urlInput         = document.getElementById('url-input');
-const goBtn            = document.getElementById('go-btn');
-const statusDot        = document.querySelector('.status-dot');
-const statusText       = document.querySelector('.status-text');
-const loadingOverlay   = document.getElementById('loading-overlay');
-const loadingText      = document.getElementById('loading-text');
-const tabsContainer    = document.getElementById('tabs-container');
-const newTabBtn        = document.getElementById('new-tab-btn');
-const backBtn          = document.getElementById('back-btn');
-const forwardBtn       = document.getElementById('forward-btn');
-const reloadBtn        = document.getElementById('reload-btn');
-const clipBtn          = document.getElementById('clip-btn');
-const clipModal        = document.getElementById('clip-modal');
-const clipCloseBtn     = document.getElementById('clip-close-btn');
-const clipText         = document.getElementById('clip-text');
-const clipPushBtn      = document.getElementById('clip-push-btn');
+const imgA              = document.getElementById('screencast-a');
+const imgB              = document.getElementById('screencast-b');
+const overlay           = document.getElementById('interaction-overlay');
+const urlInput          = document.getElementById('url-input');
+const goBtn             = document.getElementById('go-btn');
+const statusDot         = document.querySelector('.status-dot');
+const statusText        = document.querySelector('.status-text');
+const loadingOverlay    = document.getElementById('loading-overlay');
+const loadingText       = document.getElementById('loading-text');
+const tabsContainer     = document.getElementById('tabs-container');
+const newTabBtn         = document.getElementById('new-tab-btn');
+const backBtn           = document.getElementById('back-btn');
+const forwardBtn        = document.getElementById('forward-btn');
+const reloadBtn         = document.getElementById('reload-btn');
 
+// Clipboard modal
+const clipBtn           = document.getElementById('clip-btn');
+const clipModal         = document.getElementById('clip-modal');
+const clipCloseBtn      = document.getElementById('clip-close-btn');
+const clipText          = document.getElementById('clip-text');
+const clipPushBtn       = document.getElementById('clip-push-btn');
+
+// Settings modal
 const settingsBtn       = document.getElementById('settings-btn');
 const settingsModal     = document.getElementById('settings-modal');
 const settingsCloseBtn  = document.getElementById('settings-close-btn');
@@ -46,7 +49,7 @@ const zoomOutBtn        = document.getElementById('zoom-out-btn');
 const zoomResetBtn      = document.getElementById('zoom-reset-btn');
 const zoomDisplay       = document.getElementById('zoom-level-display');
 
-// Toolbar new buttons
+// Toolbar buttons
 const findBtn           = document.getElementById('find-btn');
 const downloadsBtn      = document.getElementById('downloads-btn');
 const muteBtn           = document.getElementById('mute-btn');
@@ -75,6 +78,15 @@ const findPrevBtn       = document.getElementById('find-prev-btn');
 const findNextBtn       = document.getElementById('find-next-btn');
 const findCloseBtn      = document.getElementById('find-close-btn');
 
+// Dialog modal
+const dialogModal       = document.getElementById('dialog-modal');
+const dialogTitle       = document.getElementById('dialog-title');
+const dialogMessage     = document.getElementById('dialog-message');
+const dialogInputGroup  = document.getElementById('dialog-input-group');
+const dialogInput       = document.getElementById('dialog-input');
+const dialogOkBtn       = document.getElementById('dialog-ok-btn');
+const dialogCancelBtn   = document.getElementById('dialog-cancel-btn');
+
 // Progress bar
 const loadingProgress   = document.getElementById('loading-progress');
 
@@ -95,11 +107,16 @@ const ctxNewTab         = document.getElementById('ctx-newtab');
 const ctxAdblock        = document.getElementById('ctx-adblock');
 const ctxClear          = document.getElementById('ctx-clear');
 
-// ---------- State ----------
+// Windows-style titlebar controls
+const winMinimize       = document.querySelector('.win-minimize');
+const winMaximize       = document.querySelector('.win-maximize');
+const winClose          = document.querySelector('.win-close');
+
+// ---------- Client State ----------
 let ws = null;
 let appInitialized = false;
 let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 3;
+const MAX_RECONNECT_ATTEMPTS = 5;
 let reconnectTimer = null;
 let activeTabId = null;
 let loadingTimer = null;
@@ -107,15 +124,15 @@ let zoomLevel = 1.0;
 let isMuted = false;
 let pendingUploadFile = null;
 
-// Double buffer variables for flicker-free streaming
+// Double buffer references for flicker-free screencast rendering
 let activeImg = imgA;
 let bufferImg = imgB;
 
-// Remote browser resolution — must match server.js viewport
-const REMOTE_W = 1920;
-const REMOTE_H = 1080;
+// Dynamic viewport dimensions matching the remote Playwright instance
+let remoteWidth = 1920;
+let remoteHeight = 1080;
 
-// ---------- Login ----------
+// ---------- Login Flow ----------
 let loginThrottleUntil = 0;
 let loginCountdownTimer = null;
 
@@ -139,13 +156,11 @@ function startLoginCountdown(seconds) {
 loginForm.addEventListener('submit', async (e) => {
     e.preventDefault();
 
-    // Client-side throttle guard
     if (Date.now() < loginThrottleUntil) return;
 
-    // Sanitise input — strip leading/trailing whitespace, enforce max length
     const rawPassword = passwordInput.value;
     if (!rawPassword || rawPassword.length > 256) {
-        loginError.textContent = 'Password is required and must be under 256 characters.';
+        loginError.textContent = 'Password is required (under 256 characters).';
         loginError.classList.remove('hidden');
         return;
     }
@@ -156,7 +171,7 @@ loginForm.addEventListener('submit', async (e) => {
 
     try {
         const res = await fetch('/api/login', {
-            method:  'POST',
+            method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'X-Requested-With': 'XMLHttpRequest'
@@ -165,48 +180,40 @@ loginForm.addEventListener('submit', async (e) => {
             credentials: 'same-origin'
         });
 
-        // Parse Retry-After header if present (server signals lockout duration)
         const retryAfter = parseInt(res.headers.get('Retry-After') || '0', 10);
-        const data = await res.json();
+        const data = await res.json().catch(() => ({ success: false, error: 'Malformed response' }));
 
         if (data.success) {
-            // Marker only — real session is the HttpOnly cookie set by the server
             sessionStorage.setItem('vb_token', '1');
             passwordInput.value = '';
             loginScreen.classList.add('hidden');
             appContainer.classList.remove('hidden');
             initApp();
         } else {
-            // Show server error — escape the string to prevent reflected XSS
             const msg = String(data.error || 'Incorrect password').slice(0, 200);
             loginError.textContent = msg;
             loginError.classList.remove('hidden');
 
             if (retryAfter > 0) {
-                // Lock the button for the server-specified duration
                 loginThrottleUntil = Date.now() + retryAfter * 1000;
                 startLoginCountdown(retryAfter);
-            } else if (res.status === 401) {
-                // Apply a small client-side delay between attempts regardless
-                loginThrottleUntil = Date.now() + 1500;
+            } else {
+                loginThrottleUntil = Date.now() + 1000;
                 setTimeout(() => {
                     loginBtn.disabled = false;
                     loginBtn.querySelector('span').textContent = 'Connect';
-                }, 1500);
-            } else {
-                loginBtn.disabled = false;
-                loginBtn.querySelector('span').textContent = 'Connect';
+                }, 1000);
             }
         }
     } catch {
-        loginError.textContent = 'Connection error — is the server running?';
+        loginError.textContent = 'Connection error — check server status.';
         loginError.classList.remove('hidden');
         loginBtn.disabled = false;
         loginBtn.querySelector('span').textContent = 'Connect';
     }
 });
 
-// ---------- Main App ----------
+// ---------- Session & WebSocket Lifecycle ----------
 async function logoutServer() {
     try {
         await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
@@ -219,13 +226,16 @@ function resetToLogin(errorMsg, { revoke = true } = {}) {
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     reconnectAttempts = 0;
     appInitialized = false;
+
     if (ws) {
         try { ws.close(); } catch (_) {}
         ws = null;
     }
+
     hideOverlay();
     appContainer.classList.add('hidden');
     loginScreen.classList.remove('hidden');
+
     if (errorMsg) {
         loginError.textContent = errorMsg;
         loginError.classList.remove('hidden');
@@ -245,7 +255,6 @@ function connectWS() {
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // Auth via HttpOnly cookie (same-origin). Do not put tokens in the URL.
     ws = new WebSocket(`${proto}//${location.host}/`);
     ws.binaryType = 'arraybuffer';
 
@@ -266,7 +275,7 @@ function connectWS() {
 
         reconnectAttempts++;
         if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-            resetToLogin('Unable to connect to server. Please log in again.');
+            resetToLogin('Connection lost. Please log in again.');
             return;
         }
 
@@ -278,43 +287,30 @@ function connectWS() {
         reconnectTimer = setTimeout(() => connectWS(), 2000);
     };
 
-    ws.onerror = () => {
-        // onclose will fire right after — let that handle UI
-    };
+    ws.onerror = () => {};
 
     ws.onmessage = (event) => {
-        let isBinary = false;
-        let blob = null;
-
+        // Binary image frames (screencast)
         if (event.data instanceof ArrayBuffer) {
-            isBinary = true;
             const view = new Uint8Array(event.data);
             let mime = 'image/jpeg';
-            // PNG magic bytes check: 89 50 4E 47
             if (view[0] === 0x89 && view[1] === 0x50 && view[2] === 0x4E && view[3] === 0x47) {
                 mime = 'image/png';
             }
-            blob = new Blob([event.data], { type: mime });
-        }
-
-        if (isBinary && blob) {
+            const blob = new Blob([event.data], { type: mime });
             const url = URL.createObjectURL(blob);
-            
+
             bufferImg.onload = () => {
-                // Swap active and buffer images
                 bufferImg.classList.add('active');
                 activeImg.classList.remove('active');
 
-                // Toggle references
                 const temp = activeImg;
                 activeImg = bufferImg;
                 bufferImg = temp;
 
-                // Revoke old URL of the new bufferImg (which was the old activeImg)
                 if (bufferImg.dataset.srcUrl) {
                     URL.revokeObjectURL(bufferImg.dataset.srcUrl);
                 }
-                // Save current URL to revoke on the next frame swap
                 activeImg.dataset.srcUrl = url;
 
                 if (!viewportContainer.classList.contains('ready')) {
@@ -338,6 +334,13 @@ function connectWS() {
         try { msg = JSON.parse(event.data); } catch { return; }
 
         switch (msg.type) {
+            case 'viewport_dimensions':
+                if (typeof msg.width === 'number' && typeof msg.height === 'number') {
+                    remoteWidth = msg.width;
+                    remoteHeight = msg.height;
+                }
+                break;
+
             case 'url_changed':
                 if (document.activeElement !== urlInput) {
                     urlInput.value = msg.url;
@@ -355,11 +358,15 @@ function connectWS() {
             case 'clipboard':
                 clipText.value = msg.text;
                 clipText.classList.remove('clip-glow-anim');
-                void clipText.offsetWidth; // Trigger reflow
+                void clipText.offsetWidth;
                 clipText.classList.add('clip-glow-anim');
                 if (navigator.clipboard && navigator.clipboard.writeText) {
                     navigator.clipboard.writeText(msg.text).catch(() => {});
                 }
+                break;
+
+            case 'dialog':
+                showDialogModal(msg.message, msg.dialogType, msg.defaultValue);
                 break;
 
             case 'auth_error':
@@ -390,12 +397,13 @@ function connectWS() {
     };
 }
 
+// ---------- Loading Progress & Overlay ----------
 function handleLoadingState(loading) {
     if (loading) {
         clearTimeout(loadingTimer);
         loadingProgress.style.opacity = '1';
         loadingProgress.style.width = '0%';
-        void loadingProgress.offsetWidth; // Trigger reflow
+        void loadingProgress.offsetWidth;
         loadingProgress.style.transition = 'width 2s cubic-bezier(0.1, 0.8, 0.3, 1)';
         loadingProgress.style.width = '90%';
     } else {
@@ -410,24 +418,23 @@ function handleLoadingState(loading) {
     }
 }
 
-// ---------- Overlay ----------
 function showOverlay(text) {
     if (loadingText) loadingText.textContent = text || 'Loading...';
     loadingOverlay.classList.remove('hidden');
 }
+
 function hideOverlay() {
     loadingOverlay.classList.add('hidden');
 }
 
-// ---------- Messaging ----------
 function sendMsg(msg) {
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(msg));
     }
 }
 
-// ---------- Tabs ----------
-const tabDomMap = new Map(); // tabId -> tabEl
+// ---------- Tab Management ----------
+const tabDomMap = new Map();
 
 function renderTabs(tabs) {
     const seenIds = new Set();
@@ -440,9 +447,9 @@ function renderTabs(tabs) {
         let tabEl = tabDomMap.get(tab.id);
 
         if (!tabEl) {
-            // Create new tab element
             tabEl = document.createElement('div');
             tabEl.dataset.tabId = tab.id;
+            tabEl.setAttribute('role', 'tab');
 
             const iconEl = document.createElement('img');
             iconEl.className = 'tab-icon';
@@ -463,7 +470,7 @@ function renderTabs(tabs) {
 
             tabEl.addEventListener('click', () => {
                 if (!tabEl.classList.contains('active')) {
-                    showOverlay('Switching tabs...');
+                    showOverlay('Switching tab...');
                     viewportContainer.classList.remove('ready');
                     sendMsg({ type: 'switch_tab', tabId: tab.id });
                 }
@@ -471,6 +478,9 @@ function renderTabs(tabs) {
 
             closeBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
+                if (tabEl.classList.contains('active') && tabs.length > 1) {
+                    showOverlay('Closing tab...');
+                }
                 sendMsg({ type: 'close_tab', tabId: tab.id });
             });
 
@@ -478,7 +488,6 @@ function renderTabs(tabs) {
             tabsContainer.appendChild(tabEl);
         }
 
-        // Diff-update: only change what actually changed
         const iconEl  = tabEl.querySelector('.tab-icon');
         const titleEl = tabEl.querySelector('.tab-title');
 
@@ -492,9 +501,9 @@ function renderTabs(tabs) {
 
         const isActive = tab.isActive;
         tabEl.className = `tab${isActive ? ' active' : ''}`;
+        tabEl.setAttribute('aria-selected', isActive ? 'true' : 'false');
     });
 
-    // Remove tabs that no longer exist
     for (const [id, el] of tabDomMap) {
         if (!seenIds.has(id)) {
             el.remove();
@@ -502,7 +511,6 @@ function renderTabs(tabs) {
         }
     }
 
-    // Ensure DOM order matches server order
     tabs.forEach(tab => {
         const el = tabDomMap.get(tab.id);
         if (el) tabsContainer.appendChild(el);
@@ -511,47 +519,91 @@ function renderTabs(tabs) {
 
 newTabBtn.addEventListener('click', () => sendMsg({ type: 'new_tab' }));
 
-// ---------- Coordinate Mapping ----------
-function getMappedCoords(e) {
+// ---------- Coordinate Mapping (Dynamic Viewport Resolution) ----------
+function getMappedCoords(clientX, clientY) {
     const rect = overlay.getBoundingClientRect();
+    const scaleX = remoteWidth / rect.width;
+    const scaleY = remoteHeight / rect.height;
+
+    const x = Math.round((clientX - rect.left) * scaleX);
+    const y = Math.round((clientY - rect.top) * scaleY);
+
     return {
-        x: Math.round((e.clientX - rect.left) * (REMOTE_W / rect.width)),
-        y: Math.round((e.clientY - rect.top)  * (REMOTE_H / rect.height))
+        x: Math.max(0, Math.min(remoteWidth, x)),
+        y: Math.max(0, Math.min(remoteHeight, y))
     };
 }
 
 const mapButton = (e) => ['left', 'middle', 'right'][e.button] ?? 'left';
 
-// ---------- Mouse Events ----------
+// Mouse Event Listeners
 let lastMoveTime = 0;
 overlay.addEventListener('mousemove', (e) => {
     const now = performance.now();
-    if (now - lastMoveTime < 33) return; // Cap at ~30fps
+    if (now - lastMoveTime < 33) return; // ~30fps throttle
     lastMoveTime = now;
-    const c = getMappedCoords(e);
+    const c = getMappedCoords(e.clientX, e.clientY);
     sendMsg({ type: 'mousemove', x: c.x, y: c.y });
 });
 
 overlay.addEventListener('mousedown', (e) => {
     e.preventDefault();
     viewportContainer.focus();
-    const c = getMappedCoords(e);
+    const c = getMappedCoords(e.clientX, e.clientY);
     sendMsg({ type: 'mousedown', x: c.x, y: c.y, button: mapButton(e) });
 });
 
 overlay.addEventListener('mouseup', (e) => {
-    const c = getMappedCoords(e);
+    const c = getMappedCoords(e.clientX, e.clientY);
     sendMsg({ type: 'mouseup', x: c.x, y: c.y, button: mapButton(e) });
 });
 
-overlay.addEventListener('contextmenu', e => e.preventDefault());
+overlay.addEventListener('contextmenu', (e) => e.preventDefault());
 
 overlay.addEventListener('wheel', (e) => {
     e.preventDefault();
     sendMsg({ type: 'wheel', deltaX: e.deltaX, deltaY: e.deltaY });
 }, { passive: false });
 
-// ---------- Keyboard ----------
+// Touch Event Listeners (Mobile / iPad / Touchscreen Support)
+let activeTouch = false;
+overlay.addEventListener('touchstart', (e) => {
+    if (e.touches.length > 0) {
+        activeTouch = true;
+        const touch = e.touches[0];
+        const c = getMappedCoords(touch.clientX, touch.clientY);
+        sendMsg({ type: 'mousemove', x: c.x, y: c.y });
+        sendMsg({ type: 'mousedown', x: c.x, y: c.y, button: 'left' });
+    }
+}, { passive: true });
+
+overlay.addEventListener('touchmove', (e) => {
+    if (activeTouch && e.touches.length > 0) {
+        const now = performance.now();
+        if (now - lastMoveTime < 33) return;
+        lastMoveTime = now;
+        const touch = e.touches[0];
+        const c = getMappedCoords(touch.clientX, touch.clientY);
+        sendMsg({ type: 'mousemove', x: c.x, y: c.y });
+    }
+}, { passive: true });
+
+overlay.addEventListener('touchend', (e) => {
+    if (activeTouch) {
+        activeTouch = false;
+        if (e.changedTouches.length > 0) {
+            const touch = e.changedTouches[0];
+            const c = getMappedCoords(touch.clientX, touch.clientY);
+            sendMsg({ type: 'mouseup', x: c.x, y: c.y, button: 'left' });
+        }
+    }
+}, { passive: true });
+
+overlay.addEventListener('touchcancel', () => {
+    activeTouch = false;
+});
+
+// ---------- Keyboard Handling ----------
 function getModifiers(e) {
     const mods = [];
     if (e.ctrlKey)  mods.push('Control');
@@ -569,12 +621,25 @@ const INTERCEPT_KEYS = new Set([
 ]);
 
 window.addEventListener('keydown', (e) => {
-    if (document.activeElement === urlInput || document.activeElement === passwordInput) return;
+    // If user is focused on local input elements, ignore global browser keyboard events
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) {
+        if (e.key === 'Escape') {
+            closeAllModals();
+            viewportContainer.focus();
+        }
+        return;
+    }
+
+    if (e.key === 'Escape') {
+        closeAllModals();
+        return;
+    }
+
     if (document.activeElement !== viewportContainer) return;
 
     const isCmdOrCtrl = e.ctrlKey || e.metaKey;
 
-    // Ctrl + V (Paste from local desktop clipboard)
+    // Clipboard Paste (Ctrl+V)
     if (isCmdOrCtrl && e.key.toLowerCase() === 'v') {
         e.preventDefault();
         if (navigator.clipboard && navigator.clipboard.readText) {
@@ -583,7 +648,6 @@ window.addEventListener('keydown', (e) => {
                     if (text) sendMsg({ type: 'type', text });
                 })
                 .catch(() => {
-                    // Fallback to clipboard sync modal if permission is not granted
                     clipModal.classList.remove('hidden');
                     clipText.focus();
                     clipText.select();
@@ -596,11 +660,14 @@ window.addEventListener('keydown', (e) => {
         return;
     }
 
+    // New Tab (Ctrl+T)
     if (isCmdOrCtrl && e.key.toLowerCase() === 't') {
         e.preventDefault();
         sendMsg({ type: 'new_tab' });
         return;
     }
+
+    // Find in Page (Ctrl+F)
     if (isCmdOrCtrl && e.key.toLowerCase() === 'f') {
         e.preventDefault();
         findBar.classList.remove('hidden');
@@ -608,18 +675,22 @@ window.addEventListener('keydown', (e) => {
         findInput.select();
         return;
     }
+
+    // Close Tab (Ctrl+W)
     if (isCmdOrCtrl && e.key.toLowerCase() === 'w') {
         e.preventDefault();
-        if (activeTabId) {
-            sendMsg({ type: 'close_tab', tabId: activeTabId });
-        }
+        if (activeTabId) sendMsg({ type: 'close_tab', tabId: activeTabId });
         return;
     }
+
+    // Reload (Ctrl+R / F5)
     if ((isCmdOrCtrl && e.key.toLowerCase() === 'r') || e.key === 'F5') {
         e.preventDefault();
         sendMsg({ type: 'reload' });
         return;
     }
+
+    // Navigation (Alt+Left / Alt+Right)
     if (e.altKey && e.key === 'ArrowLeft') {
         e.preventDefault();
         sendMsg({ type: 'back' });
@@ -638,7 +709,7 @@ window.addEventListener('keydown', (e) => {
 }, { passive: false });
 
 window.addEventListener('keyup', (e) => {
-    if (document.activeElement === urlInput || document.activeElement === passwordInput) return;
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
     if (document.activeElement !== viewportContainer) return;
     sendMsg({ type: 'keyup', key: e.key, modifiers: getModifiers(e) });
 });
@@ -649,7 +720,7 @@ window.addEventListener('paste', (e) => {
     if (text) sendMsg({ type: 'type', text });
 });
 
-// ---------- URL Bar ----------
+// ---------- Address & Search Bar ----------
 function navigate() {
     const input = urlInput.value.trim();
     if (!input) return;
@@ -666,23 +737,66 @@ urlInput.addEventListener('keydown', (e) => {
 
 urlInput.addEventListener('focus', () => urlInput.select());
 
-// ---------- Navigation Buttons ----------
+// Navigation Buttons
 backBtn.addEventListener('click', () => sendMsg({ type: 'back' }));
 forwardBtn.addEventListener('click', () => sendMsg({ type: 'forward' }));
 reloadBtn.addEventListener('click', () => sendMsg({ type: 'reload' }));
 
-// ---------- Clipboard Panel ----------
+// ---------- Remote Dialog Modal (Alert, Confirm, Prompt) ----------
+function showDialogModal(message, dialogType, defaultValue) {
+    dialogTitle.textContent = dialogType === 'prompt' ? 'Website Prompt' : (dialogType === 'confirm' ? 'Confirm Action' : 'Website Message');
+    dialogMessage.textContent = message || '';
+
+    if (dialogType === 'prompt') {
+        dialogInputGroup.classList.remove('hidden');
+        dialogInput.value = defaultValue || '';
+        dialogCancelBtn.classList.remove('hidden');
+    } else if (dialogType === 'confirm') {
+        dialogInputGroup.classList.add('hidden');
+        dialogCancelBtn.classList.remove('hidden');
+    } else {
+        dialogInputGroup.classList.add('hidden');
+        dialogCancelBtn.classList.add('hidden');
+    }
+
+    dialogModal.classList.remove('hidden');
+    if (dialogType === 'prompt') {
+        dialogInput.focus();
+        dialogInput.select();
+    } else {
+        dialogOkBtn.focus();
+    }
+}
+
+dialogOkBtn.addEventListener('click', () => {
+    const promptText = dialogInput.value;
+    dialogModal.classList.add('hidden');
+    sendMsg({ type: 'dialog_response', accept: true, promptText });
+    viewportContainer.focus();
+});
+
+dialogCancelBtn.addEventListener('click', () => {
+    dialogModal.classList.add('hidden');
+    sendMsg({ type: 'dialog_response', accept: false });
+    viewportContainer.focus();
+});
+
+dialogInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') dialogOkBtn.click();
+    if (e.key === 'Escape') dialogCancelBtn.click();
+});
+
+// ---------- Clipboard Manager ----------
 clipBtn.addEventListener('click', () => {
     clipModal.classList.toggle('hidden');
     if (!clipModal.classList.contains('hidden')) {
+        closeAllModals([clipModal]);
         clipText.focus();
         clipText.select();
     }
 });
 
-clipCloseBtn.addEventListener('click', () => {
-    clipModal.classList.add('hidden');
-});
+clipCloseBtn.addEventListener('click', () => clipModal.classList.add('hidden'));
 
 clipPushBtn.addEventListener('click', () => {
     const text = clipText.value;
@@ -693,43 +807,39 @@ clipPushBtn.addEventListener('click', () => {
     }
 });
 
-// ---------- Settings Panel ----------
+// ---------- Session Settings Modal ----------
 settingsBtn.addEventListener('click', () => {
     settingsModal.classList.toggle('hidden');
-    clipModal.classList.add('hidden'); // prevent overlapping
+    if (!settingsModal.classList.contains('hidden')) {
+        closeAllModals([settingsModal]);
+    }
 });
 
-settingsCloseBtn.addEventListener('click', () => {
-    settingsModal.classList.add('hidden');
-});
+settingsCloseBtn.addEventListener('click', () => settingsModal.classList.add('hidden'));
 
 adblockToggle.addEventListener('change', () => {
     sendMsg({ type: 'toggle_adblocker', enabled: adblockToggle.checked });
 });
 
-// ---------- Free VPN (Cloudflare WARP) ----------
 vpnToggle.addEventListener('change', () => {
     const enabled = vpnToggle.checked;
     sendMsg({ type: 'toggle_vpn', enabled });
-    showOverlay(enabled
-        ? '⚡ Connecting to Cloudflare WARP VPN...'
-        : '🔓 Disconnecting from WARP VPN...');
+    showOverlay(enabled ? '⚡ Connecting to Cloudflare WARP VPN...' : '🔓 Disconnecting from WARP VPN...');
     settingsModal.classList.add('hidden');
 });
 
-// ---------- Proxy Settings ----------
 proxyApplyBtn.addEventListener('click', () => {
     const proxy = proxyInput.value.trim();
     if (!proxy) return;
     sendMsg({ type: 'set_proxy', proxy });
-    showOverlay('Applying proxy & restarting context...');
+    showOverlay('Applying proxy & restarting browser context...');
     settingsModal.classList.add('hidden');
 });
 
 proxyClearBtn.addEventListener('click', () => {
     proxyInput.value = '';
     sendMsg({ type: 'set_proxy', proxy: '' });
-    showOverlay('Clearing proxy & restarting context...');
+    showOverlay('Clearing proxy & restarting browser context...');
     settingsModal.classList.add('hidden');
 });
 
@@ -737,7 +847,7 @@ proxyInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') proxyApplyBtn.click();
 });
 
-// ---------- Zoom Controls ----------
+// Zoom Controls
 function applyZoom(level) {
     zoomLevel = Math.min(5.0, Math.max(0.2, level));
     zoomDisplay.textContent = Math.round(zoomLevel * 100) + '%';
@@ -748,7 +858,7 @@ zoomInBtn.addEventListener('click', () => applyZoom(zoomLevel + 0.1));
 zoomOutBtn.addEventListener('click', () => applyZoom(zoomLevel - 0.1));
 zoomResetBtn.addEventListener('click', () => applyZoom(1.0));
 
-// ---------- Mute Toggle ----------
+// Mute Toggle
 muteBtn.addEventListener('click', () => {
     isMuted = !isMuted;
     sendMsg({ type: 'set_mute', muted: isMuted });
@@ -757,10 +867,46 @@ muteBtn.addEventListener('click', () => {
     muteBtn.title = isMuted ? 'Unmute Tab' : 'Mute Tab';
 });
 
-// ---------- Find In Page ----------
+// User-Agent Selection
+uaSelect.addEventListener('change', () => {
+    const val = uaSelect.value;
+    if (val === 'custom') {
+        customUaInput.classList.remove('hidden');
+        customUaInput.focus();
+    } else {
+        customUaInput.classList.add('hidden');
+        sendMsg({ type: 'set_useragent', userAgent: val });
+        showOverlay('Updating User-Agent profile...');
+    }
+});
+
+customUaInput.addEventListener('blur', () => {
+    const ua = customUaInput.value.trim();
+    if (ua) {
+        sendMsg({ type: 'set_useragent', userAgent: ua });
+        showOverlay('Updating custom User-Agent...');
+    }
+});
+
+customUaInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        customUaInput.blur();
+        viewportContainer.focus();
+    }
+});
+
+clearSessionBtn.addEventListener('click', () => {
+    if (confirm('Are you sure you want to clear session cookies, permissions, and cache?')) {
+        sendMsg({ type: 'clear_session' });
+        settingsModal.classList.add('hidden');
+    }
+});
+
+// ---------- Find in Page ----------
 findBtn.addEventListener('click', () => {
     findBar.classList.toggle('hidden');
     if (!findBar.classList.contains('hidden')) {
+        closeAllModals([findBar]);
         findInput.focus();
         findInput.select();
     } else {
@@ -773,6 +919,7 @@ findCloseBtn.addEventListener('click', () => {
     findBar.classList.add('hidden');
     sendMsg({ type: 'find', query: '' });
     findCount.textContent = '';
+    viewportContainer.focus();
 });
 
 let findDebounce = null;
@@ -794,14 +941,15 @@ findInput.addEventListener('keydown', (e) => {
 findNextBtn.addEventListener('click', () => sendMsg({ type: 'find_next', forward: true }));
 findPrevBtn.addEventListener('click', () => sendMsg({ type: 'find_next', forward: false }));
 
-// ---------- Downloads Panel ----------
+// ---------- Downloads Drawer ----------
 downloadsBtn.addEventListener('click', () => {
     downloadsPanel.classList.toggle('hidden');
+    if (!downloadsPanel.classList.contains('hidden')) {
+        closeAllModals([downloadsPanel]);
+    }
 });
 
-downloadsCloseBtn.addEventListener('click', () => {
-    downloadsPanel.classList.add('hidden');
-});
+downloadsCloseBtn.addEventListener('click', () => downloadsPanel.classList.add('hidden'));
 
 function addDownloadItem(filename, url) {
     const empty = downloadsList.querySelector('.downloads-empty');
@@ -839,7 +987,7 @@ function addDownloadItem(filename, url) {
     downloadsList.prepend(item);
 }
 
-// ---------- File Upload Panel ----------
+// ---------- File Upload Modal ----------
 uploadPickBtn.addEventListener('click', () => localFileInput.click());
 
 localFileInput.addEventListener('change', () => {
@@ -854,7 +1002,7 @@ uploadSendBtn.addEventListener('click', () => {
     if (!pendingUploadFile) return;
     const MAX_UPLOAD = 8 * 1024 * 1024;
     if (pendingUploadFile.size > MAX_UPLOAD) {
-        alert('File is too large (max 8 MB).');
+        alert('File is too large (maximum allowed size is 8 MB).');
         return;
     }
     const reader = new FileReader();
@@ -870,56 +1018,37 @@ uploadSendBtn.addEventListener('click', () => {
     reader.readAsDataURL(pendingUploadFile);
 });
 
-uploadCancelBtn.addEventListener('click', () => {
+function cancelUpload() {
     uploadPanel.classList.add('hidden');
     pendingUploadFile = null;
     localFileInput.value = '';
     uploadFilename.textContent = 'No file chosen';
     uploadSendBtn.disabled = true;
-});
+    sendMsg({ type: 'file_chooser_cancel' });
+}
 
-uploadCloseBtn.addEventListener('click', () => {
-    uploadPanel.classList.add('hidden');
-});
+uploadCancelBtn.addEventListener('click', cancelUpload);
+uploadCloseBtn.addEventListener('click', cancelUpload);
 
-uaSelect.addEventListener('change', () => {
-    const val = uaSelect.value;
-    if (val === 'custom') {
-        customUaInput.classList.remove('hidden');
-        customUaInput.focus();
+// ---------- Stream Performance Quality ----------
+qualitySelect.addEventListener('change', () => {
+    const val = qualitySelect.value;
+    if (val === 'png') {
+        sendMsg({ type: 'set_stream_quality', format: 'png' });
+    } else if (val === 'jpeg_98') {
+        sendMsg({ type: 'set_stream_quality', format: 'jpeg', quality: 98 });
+    } else if (val === 'jpeg_90') {
+        sendMsg({ type: 'set_stream_quality', format: 'jpeg', quality: 90 });
     } else {
-        customUaInput.classList.add('hidden');
-        sendMsg({ type: 'set_useragent', userAgent: val });
+        sendMsg({ type: 'set_stream_quality', format: 'jpeg', quality: 80 });
     }
 });
-
-customUaInput.addEventListener('blur', () => {
-    const ua = customUaInput.value.trim();
-    if (ua) {
-        sendMsg({ type: 'set_useragent', userAgent: ua });
-    }
-});
-
-customUaInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-        customUaInput.blur();
-        viewportContainer.focus();
-    }
-});
-
-clearSessionBtn.addEventListener('click', () => {
-    if (confirm('Are you sure you want to clear session cookies, permissions, and cache?')) {
-        sendMsg({ type: 'clear_session' });
-        settingsModal.classList.add('hidden');
-    }
-});
-
 
 // ---------- Bookmarks Bar ----------
 const DEFAULT_BOOKMARKS = [
     { name: 'Google', url: 'https://www.google.com' },
-    { name: 'YouTube', url: 'https://www.youtube.com' },
-    { name: 'GitHub', url: 'https://github.com' }
+    { name: 'GitHub', url: 'https://github.com' },
+    { name: 'Debian', url: 'https://www.debian.org' }
 ];
 
 let bookmarks = [];
@@ -950,14 +1079,13 @@ function renderBookmarks() {
     bookmarks.forEach((bm, index) => {
         const item = document.createElement('div');
         item.className = 'bookmark-item';
-        
-        // Simple favicon helper
+
         const icon = document.createElement('img');
         icon.className = 'bookmark-item-icon';
-        
+
         let domain = bm.url;
         try { domain = new URL(bm.url).hostname; } catch (_) {}
-        icon.src = `https://www.google.com/s2/favicons?domain=${domain}&sz=16`;
+        icon.src = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=16`;
         icon.onerror = () => { icon.style.display = 'none'; };
 
         const nameSpan = document.createElement('span');
@@ -971,7 +1099,6 @@ function renderBookmarks() {
             navigate();
         });
 
-        // Right click to delete bookmark
         item.addEventListener('contextmenu', (e) => {
             e.preventDefault();
             if (confirm(`Remove bookmark "${bm.name}"?`)) {
@@ -1002,38 +1129,22 @@ addBookmarkBtn.addEventListener('click', () => {
     }
 
     const name = prompt('Enter bookmark name:', hostname);
-    if (name === null) return; // cancelled
+    if (name === null) return;
 
     bookmarks.push({ name: name.trim() || hostname, url: targetUrl });
     saveBookmarks();
     renderBookmarks();
 });
 
-// Initialize bookmarks
 loadBookmarks();
-
-// ---------- Stream Performance Settings ----------
-qualitySelect.addEventListener('change', () => {
-    const val = qualitySelect.value;
-    if (val === 'png') {
-        sendMsg({ type: 'set_stream_quality', format: 'png' });
-    } else if (val === 'jpeg_98') {
-        sendMsg({ type: 'set_stream_quality', format: 'jpeg', quality: 98 });
-    } else if (val === 'jpeg_90') {
-        sendMsg({ type: 'set_stream_quality', format: 'jpeg', quality: 90 });
-    } else {
-        sendMsg({ type: 'set_stream_quality', format: 'jpeg', quality: 80 });
-    }
-});
 
 // ---------- Custom Context Menu ----------
 overlay.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     contextMenu.classList.remove('hidden');
-    
-    // Position menu exactly under cursor, checking boundaries
-    const menuW = 180;
-    const menuH = 200;
+
+    const menuW = 190;
+    const menuH = 220;
     let x = e.clientX;
     let y = e.clientY;
 
@@ -1044,12 +1155,12 @@ overlay.addEventListener('contextmenu', (e) => {
     contextMenu.style.top = `${y}px`;
 });
 
-// Hide context menu on left click anywhere
-document.addEventListener('click', () => {
-    contextMenu.classList.add('hidden');
+document.addEventListener('click', (e) => {
+    if (!contextMenu.contains(e.target)) {
+        contextMenu.classList.add('hidden');
+    }
 });
 
-// Context Menu Action Listeners
 ctxBack.addEventListener('click', () => sendMsg({ type: 'back' }));
 ctxForward.addEventListener('click', () => sendMsg({ type: 'forward' }));
 ctxReload.addEventListener('click', () => sendMsg({ type: 'reload' }));
@@ -1064,11 +1175,7 @@ ctxClear.addEventListener('click', () => {
     }
 });
 
-// ---------- Windows-Style Titlebar Window Control Actions ----------
-const winMinimize = document.querySelector('.win-minimize');
-const winMaximize = document.querySelector('.win-maximize');
-const winClose    = document.querySelector('.win-close');
-
+// ---------- Windows-Style Titlebar Controls ----------
 if (winMinimize) {
     winMinimize.addEventListener('click', () => {
         resetToLogin();
@@ -1086,10 +1193,17 @@ if (winMaximize) {
 }
 if (winClose) {
     winClose.addEventListener('click', () => {
-        if (confirm('Are you sure you want to close the browser session and exit?')) {
+        if (confirm('Disconnect from current remote browser session?')) {
             resetToLogin();
             passwordInput.value = '';
         }
+    });
+}
+
+function closeAllModals(except = []) {
+    const list = [settingsModal, clipModal, downloadsPanel, uploadPanel, findBar, contextMenu];
+    list.forEach(m => {
+        if (!except.includes(m)) m.classList.add('hidden');
     });
 }
 

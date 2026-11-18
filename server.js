@@ -17,12 +17,13 @@ const MAX_WS_SESSIONS = parseInt(process.env.MAX_WS_SESSIONS || '6', 10);
 const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_BYTES || String(8 * 1024 * 1024), 10);
 const IDLE_TTL_MS = parseInt(process.env.IDLE_TTL_MS || String(2 * 60 * 60 * 1000), 10); // 2h idle
 const TOKEN_TTL_MS = parseInt(process.env.TOKEN_TTL_MS || String(12 * 60 * 60 * 1000), 10); // 12h absolute
+const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 
 const COOKIE_NAME = 'vb_session';
 const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 
-// ---------- Startup security assertion ----------
+// ---------- Startup Security Assertions ----------
 if (!PASSWORD || PASSWORD === 'password123') {
     console.error('[FATAL] Refusing to start with missing or default PASSWORD. Set a strong PASSWORD env var (8+ chars, not password123).');
     process.exit(1);
@@ -34,14 +35,12 @@ if (PASSWORD.length < 8) {
 
 process.on('uncaughtException', (err) => {
     console.error('[FATAL] Uncaught exception:', err.message, '\n', err.stack);
-    process.exit(1);
 });
 process.on('unhandledRejection', (reason) => {
     console.error('[FATAL] Unhandled rejection:', reason);
 });
 
-const TRUST_PROXY = process.env.TRUST_PROXY === '1';
-
+// ---------- Utility Functions ----------
 function getClientIp(req) {
     if (TRUST_PROXY) {
         const xff = req.headers['x-forwarded-for'];
@@ -49,6 +48,14 @@ function getClientIp(req) {
         return ip || 'unknown';
     }
     return req.socket.remoteAddress || 'unknown';
+}
+
+function getEffectiveHost(req) {
+    if (TRUST_PROXY) {
+        const xfh = req.headers['x-forwarded-host'];
+        if (xfh) return xfh.split(',')[0].trim();
+    }
+    return req.headers.host || '';
 }
 
 function hashToken(token) {
@@ -72,7 +79,13 @@ function parseCookies(header) {
         if (idx === -1) continue;
         const k = part.slice(0, idx).trim();
         const v = part.slice(idx + 1).trim();
-        if (k) out[k] = decodeURIComponent(v);
+        if (k) {
+            try {
+                out[k] = decodeURIComponent(v);
+            } catch {
+                out[k] = v;
+            }
+        }
     }
     return out;
 }
@@ -84,7 +97,6 @@ function extractRawToken(req) {
     const authHeader = req.headers?.authorization || '';
     if (authHeader.startsWith('Bearer ')) return authHeader.slice(7).trim();
 
-    // Legacy query param support (discouraged; still accepted briefly for reconnects)
     try {
         const u = new URL(req.url || '/', 'http://localhost');
         if (u.searchParams.get('token')) return u.searchParams.get('token');
@@ -107,27 +119,18 @@ function sessionCookie(token, req) {
     const maxAge = Math.floor(TOKEN_TTL_MS / 1000);
     const proto = (req.headers['x-forwarded-proto'] || '').toString().split(',')[0].trim();
     const secure = req.secure || proto === 'https' || process.env.FORCE_SECURE_COOKIE === '1';
-    return `${COOKIE_NAME}=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
+    return `${COOKIE_NAME}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
 }
 
 function clearSessionCookie(req) {
     const proto = (req.headers['x-forwarded-proto'] || '').toString().split(',')[0].trim();
     const secure = req.secure || proto === 'https' || process.env.FORCE_SECURE_COOKIE === '1';
-    return `${COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure ? '; Secure' : ''}`;
+    return `${COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure ? '; Secure' : ''}`;
 }
 
 function sanitizeDownloadName(name) {
     const base = path.basename(String(name || 'download')).replace(/[^\w.\-()+ ]+/g, '_').trim();
     return base.slice(0, 180) || 'download';
-}
-
-function resolveInsideDir(dir, name) {
-    const safe = sanitizeDownloadName(name);
-    const resolved = path.resolve(dir, safe);
-    if (!resolved.startsWith(path.resolve(dir) + path.sep)) {
-        throw new Error('Invalid path');
-    }
-    return { safe, resolved };
 }
 
 function isPrivateOrBlockedHost(hostname) {
@@ -137,14 +140,11 @@ function isPrivateOrBlockedHost(hostname) {
     if (host === 'metadata.google.internal') return true;
 
     const plain = host.replace(/^::ffff:/, '');
-    if (plain === '::1') return true;
-    if (/^127\./.test(plain)) return true;
-    if (/^10\./.test(plain)) return true;
-    if (/^192\.168\./.test(plain)) return true;
+    if (plain === '::1' || plain === '0.0.0.0') return true;
+    if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(plain)) return true;
     if (/^172\.(1[6-9]|2\d|3[01])\./.test(plain)) return true;
-    if (/^169\.254\./.test(plain)) return true;
-    if (/^0\./.test(plain)) return true;
     if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(plain)) return true; // CGNAT
+    if (/^(fc|fd|fe80)/i.test(plain)) return true; // IPv6 unique local & link-local
     return false;
 }
 
@@ -164,14 +164,37 @@ function assertSafeNavigationUrl(rawUrl) {
     return parsed.toString();
 }
 
-// ---------- Auth state ----------
+function validateOrigin(req) {
+    const origin = req.headers.origin || '';
+    const referer = req.headers.referer || '';
+    const host = getEffectiveHost(req);
+
+    if (origin) {
+        try {
+            return new URL(origin).host.toLowerCase() === host.toLowerCase();
+        } catch {
+            return false;
+        }
+    }
+    if (referer) {
+        try {
+            return new URL(referer).host.toLowerCase() === host.toLowerCase();
+        } catch {
+            return false;
+        }
+    }
+    // If neither origin nor referer is supplied on standard POST, reject unless disabled
+    return process.env.ALLOW_EMPTY_ORIGIN === '1';
+}
+
+// ---------- Auth State & Persistence ----------
 const validTokens = new Map();   // tokenHash -> { createdAt, ip, lastActivity }
 const loginAttempts = new Map(); // ip -> { count, lockUntil, firstAttempt }
 const globalRateMap = new Map(); // ip -> { requests, windowStart }
 const activeSockets = new Set();
 
 const LOCKOUT_THRESHOLD = 5;
-const GLOBAL_REQ_LIMIT = 120;
+const GLOBAL_REQ_LIMIT = 180;
 const GLOBAL_REQ_WINDOW = 60_000;
 const MAX_ATTEMPTS_STORED = 5_000;
 const MAX_TOKENS_STORED = 500;
@@ -190,7 +213,6 @@ function loadSessions() {
         if (!Array.isArray(data)) return;
         for (const item of data) {
             if (!item) continue;
-            // Support migration: prefer tokenHash; ignore legacy plaintext tokens
             const key = item.tokenHash || (item.token ? hashToken(item.token) : null);
             if (!key || !item.createdAt) continue;
             const meta = {
@@ -217,11 +239,14 @@ function saveSessions() {
         const tmp = SESSIONS_FILE + '.tmp';
         fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
         fs.renameSync(tmp, SESSIONS_FILE);
-    } catch (_) {}
+    } catch (e) {
+        console.warn('[auth] Could not save sessions:', e.message);
+    }
 }
 
 loadSessions();
 
+// Housekeeping interval: tokens, rate limiters, lockouts, stale downloads
 setInterval(() => {
     const now = Date.now();
     let cleaned = false;
@@ -233,106 +258,35 @@ setInterval(() => {
     }
     if (cleaned) saveSessions();
 
+    // Reset login attempts if lockout expired by > 1 hour or non-locked attempts older than 1 hour
     for (const [ip, v] of loginAttempts) {
-        if (v.lockUntil < now - 3_600_000 && v.count < LOCKOUT_THRESHOLD) loginAttempts.delete(ip);
+        if (v.lockUntil && now > v.lockUntil + 3_600_000) {
+            loginAttempts.delete(ip);
+        } else if (!v.lockUntil && now - v.firstAttempt > 3_600_000) {
+            loginAttempts.delete(ip);
+        }
     }
+
     for (const [ip, v] of globalRateMap) {
         if (now - v.windowStart > GLOBAL_REQ_WINDOW) globalRateMap.delete(ip);
     }
-}, 10 * 60 * 1000);
 
-// ---------- Middleware ----------
-app.use(express.json({ limit: '512b' }));
-app.set('trust proxy', TRUST_PROXY ? 1 : false);
+    // Prune stale downloads older than 24 hours
+    fs.readdir(downloadsDir, (err, files) => {
+        if (err || !files) return;
+        const cutoff = now - (24 * 60 * 60 * 1000);
+        files.forEach((file) => {
+            const filePath = path.join(downloadsDir, file);
+            fs.stat(filePath, (statErr, stats) => {
+                if (!statErr && stats.isFile() && stats.mtimeMs < cutoff) {
+                    fs.unlink(filePath, () => {});
+                }
+            });
+        });
+    });
+}, 5 * 60 * 1000);
 
-app.use((req, res, next) => {
-    const ip = getClientIp(req);
-    const now = Date.now();
-    const entry = globalRateMap.get(ip) || { requests: 0, windowStart: now };
-
-    if (now - entry.windowStart > GLOBAL_REQ_WINDOW) {
-        entry.requests = 0;
-        entry.windowStart = now;
-    }
-    entry.requests++;
-
-    if (globalRateMap.size > MAX_ATTEMPTS_STORED) {
-        const oldest = [...globalRateMap.entries()].sort((a, b) => a[1].windowStart - b[1].windowStart)[0];
-        if (oldest) globalRateMap.delete(oldest[0]);
-    }
-
-    globalRateMap.set(ip, entry);
-
-    if (entry.requests > GLOBAL_REQ_LIMIT) {
-        res.setHeader('Retry-After', '60');
-        return res.status(429).json({ success: false, error: 'Rate limit exceeded. Try again in 60 seconds.' });
-    }
-    next();
-});
-
-app.use((req, res, next) => {
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Referrer-Policy', 'no-referrer');
-    res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(), payment=()');
-    res.setHeader('Content-Security-Policy', [
-        "default-src 'self'",
-        "script-src 'self'",
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-        "font-src https://fonts.gstatic.com",
-        "img-src 'self' data: blob: https://www.google.com",
-        "connect-src 'self' ws: wss:",
-        "object-src 'none'",
-        "base-uri 'self'",
-        "form-action 'self'",
-        "frame-ancestors 'none'"
-    ].join('; '));
-    res.setHeader('Cache-Control', 'no-store');
-
-    const proto = (req.headers['x-forwarded-proto'] || '').toString().split(',')[0].trim();
-    if (req.secure || proto === 'https') {
-        res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-    }
-    next();
-});
-
-app.use(express.static(path.join(__dirname, 'public'), {
-    setHeaders: (res, filePath) => {
-        if (filePath.endsWith('.html')) res.setHeader('Cache-Control', 'no-store');
-        else res.setHeader('Cache-Control', 'public, max-age=300');
-    }
-}));
-
-function requireSession(req, res, next) {
-    const raw = extractRawToken(req);
-    if (!raw) return res.status(401).json({ error: 'Unauthorized' });
-    const meta = validTokens.get(hashToken(raw));
-    if (!isTokenValid(meta)) {
-        if (meta) {
-            validTokens.delete(hashToken(raw));
-            saveSessions();
-        }
-        return res.status(401).json({ error: 'Unauthorized' });
-    }
-    touchToken(meta);
-    req.sessionToken = raw;
-    req.sessionMeta = meta;
-    next();
-}
-
-app.use('/downloads', requireSession, express.static(downloadsDir, {
-    dotfiles: 'deny',
-    index: false,
-    setHeaders: (res) => {
-        res.setHeader('Content-Disposition', 'attachment');
-        res.setHeader('X-Content-Type-Options', 'nosniff');
-        res.setHeader('Cache-Control', 'private, no-store');
-    }
-}));
-
-// =============================================================================
-// THREAT INTELLIGENCE
-// =============================================================================
+// ---------- Security Logging & Threat Feeds ----------
 const ABUSEIPDB_KEY = process.env.ABUSEIPDB_KEY || null;
 const ABUSEIPDB_BLOCK_SCORE = parseInt(process.env.ABUSEIPDB_BLOCK_SCORE || '80', 10);
 const securityLogPath = path.join(dataRoot, 'security.log');
@@ -373,12 +327,6 @@ async function refreshBlocklists() {
 refreshBlocklists().catch(() => {});
 setInterval(() => refreshBlocklists().catch(() => {}), 60 * 60 * 1000);
 
-function isPrivateIp(ip) {
-    if (!ip || ip === '::1' || ip === '127.0.0.1') return true;
-    const plain = ip.replace(/^::ffff:/, '');
-    return /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|0\.|169\.254\.)/.test(plain);
-}
-
 function securityLog(event) {
     const entry = JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n';
     fs.appendFile(securityLogPath, entry, () => {});
@@ -388,7 +336,7 @@ function securityLog(event) {
 }
 
 async function checkAbuseIPDB(ip) {
-    if (!ABUSEIPDB_KEY || isPrivateIp(ip)) return null;
+    if (!ABUSEIPDB_KEY || isPrivateOrBlockedHost(ip)) return null;
     const cached = abuseScoreCache.get(ip);
     if (cached && Date.now() - cached.fetchedAt < SCORE_CACHE_TTL) return cached;
 
@@ -418,7 +366,7 @@ async function checkAbuseIPDB(ip) {
 }
 
 async function reportToAbuseIPDB(ip, comment) {
-    if (!ABUSEIPDB_KEY || isPrivateIp(ip)) return;
+    if (!ABUSEIPDB_KEY || isPrivateOrBlockedHost(ip)) return;
     try {
         const cleanIp = ip.replace(/^::ffff:/, '');
         const body = new URLSearchParams({
@@ -456,10 +404,113 @@ async function isThreatIp(ip) {
     return { blocked: false, score: abuse?.score ?? 0 };
 }
 
+// ---------- Express Middleware ----------
+app.set('trust proxy', TRUST_PROXY ? 1 : false);
+app.use(express.json({ limit: '64kb' }));
+
+// Global Rate Limiting
+app.use((req, res, next) => {
+    const ip = getClientIp(req);
+    const now = Date.now();
+    const entry = globalRateMap.get(ip) || { requests: 0, windowStart: now };
+
+    if (now - entry.windowStart > GLOBAL_REQ_WINDOW) {
+        entry.requests = 0;
+        entry.windowStart = now;
+    }
+    entry.requests++;
+
+    if (globalRateMap.size > MAX_ATTEMPTS_STORED) {
+        const oldest = [...globalRateMap.entries()].sort((a, b) => a[1].windowStart - b[1].windowStart)[0];
+        if (oldest) globalRateMap.delete(oldest[0]);
+    }
+
+    globalRateMap.set(ip, entry);
+
+    if (entry.requests > GLOBAL_REQ_LIMIT) {
+        res.setHeader('Retry-After', '60');
+        return res.status(429).json({ success: false, error: 'Rate limit exceeded. Try again in 60 seconds.' });
+    }
+    next();
+});
+
+// Security Headers
+app.use((req, res, next) => {
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(), payment=()');
+    res.setHeader('Content-Security-Policy', [
+        "default-src 'self'",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src 'self' https://fonts.gstatic.com",
+        "img-src 'self' data: blob: https://www.google.com",
+        "connect-src 'self' ws: wss:",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'"
+    ].join('; '));
+    res.setHeader('Cache-Control', 'no-store');
+
+    const proto = (req.headers['x-forwarded-proto'] || '').toString().split(',')[0].trim();
+    if (req.secure || proto === 'https') {
+        res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+    next();
+});
+
+// Static Assets
+app.use(express.static(path.join(__dirname, 'public'), {
+    setHeaders: (res, filePath) => {
+        if (filePath.endsWith('.html')) res.setHeader('Cache-Control', 'no-store');
+        else res.setHeader('Cache-Control', 'public, max-age=300');
+    }
+}));
+
+function requireSession(req, res, next) {
+    const raw = extractRawToken(req);
+    if (!raw) return res.status(401).json({ success: false, error: 'Unauthorized' });
+    const meta = validTokens.get(hashToken(raw));
+    if (!isTokenValid(meta)) {
+        if (meta) {
+            validTokens.delete(hashToken(raw));
+            saveSessions();
+        }
+        return res.status(401).json({ success: false, error: 'Unauthorized' });
+    }
+    touchToken(meta);
+    req.sessionToken = raw;
+    req.sessionMeta = meta;
+    next();
+}
+
+// Authenticated Downloads
+app.use('/downloads', requireSession, express.static(downloadsDir, {
+    dotfiles: 'deny',
+    index: false,
+    setHeaders: (res) => {
+        res.setHeader('Content-Disposition', 'attachment');
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Cache-Control', 'private, no-store');
+    }
+}));
+
+// ---------- API Routes ----------
 app.get('/healthz', (_req, res) => {
+    if (!browserReady) {
+        return res.status(503).json({
+            ok: false,
+            browserReady: false,
+            browserStarting,
+            activeSockets: activeSockets.size,
+            sessions: validTokens.size
+        });
+    }
     res.json({
         ok: true,
-        browserReady,
+        browserReady: true,
         activeSockets: activeSockets.size,
         sessions: validTokens.size
     });
@@ -467,6 +518,7 @@ app.get('/healthz', (_req, res) => {
 
 app.get('/api/security/log', requireSession, (req, res) => {
     try {
+        if (!fs.existsSync(securityLogPath)) return res.json({ count: 0, events: [] });
         const raw = fs.readFileSync(securityLogPath, 'utf8');
         const lines = raw.trim().split('\n').filter(Boolean);
         const entries = lines.slice(-200).map((l) => {
@@ -488,28 +540,17 @@ app.get('/api/security/blocklist', requireSession, (_req, res) => {
     });
 });
 
-function validateOrigin(req) {
-    const origin = req.headers.origin || '';
-    const host = req.headers.host || '';
-    if (!origin) return false;
-    try {
-        return new URL(origin).host === host;
-    } catch {
-        return false;
-    }
-}
-
 app.post('/api/login', async (req, res) => {
     const ip = getClientIp(req);
 
     if (!validateOrigin(req)) {
         securityLog({ event: 'csrf_block', ip });
-        return res.status(403).json({ success: false, error: 'Forbidden' });
+        return res.status(403).json({ success: false, error: 'Cross-origin request forbidden' });
     }
 
     const { password } = req.body || {};
     if (typeof password !== 'string' || password.length === 0 || password.length > 256) {
-        return res.status(400).json({ success: false, error: 'Invalid request' });
+        return res.status(400).json({ success: false, error: 'Password required' });
     }
 
     const threatCheck = await Promise.race([
@@ -560,7 +601,7 @@ app.post('/api/login', async (req, res) => {
         attempt.lockUntil = now + Math.min(lockSeconds * 1000, 24 * 60 * 60 * 1000);
         reportToAbuseIPDB(
             ip,
-            `Brute-force login attempt against a virtual browser application. ${attempt.count} failed attempts.`
+            `Brute-force login attempt against virtual browser application. ${attempt.count} failed attempts.`
         ).catch(() => {});
     }
 
@@ -576,7 +617,7 @@ app.post('/api/login', async (req, res) => {
 
 app.post('/api/logout', (req, res) => {
     if (!validateOrigin(req)) {
-        return res.status(403).json({ success: false, error: 'Forbidden' });
+        return res.status(403).json({ success: false, error: 'Cross-origin request forbidden' });
     }
     const raw = extractRawToken(req);
     if (raw) {
@@ -596,15 +637,185 @@ app.get('/api/session', (req, res) => {
     res.json({ authenticated: true });
 });
 
-// ---------- WebSocket Server ----------
+// Express Error Handler Middleware
+app.use((err, req, res, _next) => {
+    console.error('[express-error]', err.message);
+    res.status(err.status || 500).json({ success: false, error: err.message || 'Internal server error' });
+});
+
+// ---------- Browser Engine Management ----------
+let browser = null;
+let adblocker = null;
+let browserStarting = false;
+let browserReady = false;
+
+async function launchBrowserInstance() {
+    const launchArgs = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-accelerated-2d-canvas',
+        '--enable-font-antialiasing',
+        '--font-render-hinting=medium',
+        '--force-color-profile=srgb'
+    ];
+
+    try {
+        console.log('[*] Launching Google Chrome channel...');
+        const inst = await chromium.launch({ headless: true, channel: 'chrome', args: launchArgs });
+        inst.on('disconnected', () => {
+            console.warn('[!] Browser process disconnected or crashed.');
+            browserReady = false;
+            browser = null;
+            contextPool = null;
+        });
+        return inst;
+    } catch (err) {
+        console.warn('[!] Chrome channel unavailable, falling back to Chromium:', err.message);
+        const inst = await chromium.launch({ headless: true, args: launchArgs });
+        inst.on('disconnected', () => {
+            console.warn('[!] Browser process disconnected or crashed.');
+            browserReady = false;
+            browser = null;
+            contextPool = null;
+        });
+        return inst;
+    }
+}
+
+async function startBrowser() {
+    if (browserReady || browserStarting) return;
+    browserStarting = true;
+
+    try {
+        console.log('[*] Initializing browser engine...');
+        browser = await launchBrowserInstance();
+        browserReady = true;
+        browserStarting = false;
+        console.log('[*] Browser engine ready.');
+
+        prewarmContextPool().catch(() => {});
+
+        const cacheDir = path.join(__dirname, 'adblocker_cache');
+        fs.mkdirSync(cacheDir, { recursive: true });
+        const cachePath = path.join(cacheDir, 'adblocker.bin');
+
+        PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch, {
+            path: cachePath,
+            read: async (p) => fs.promises.readFile(p),
+            write: async (p, content) => fs.promises.writeFile(p, content)
+        }).then((loadedBlocker) => {
+            adblocker = loadedBlocker;
+            console.log('[*] Adblocker rules loaded and ready.');
+        }).catch((e) => {
+            console.warn('[!] Adblocker background load warning:', e.message);
+        });
+    } catch (err) {
+        browserStarting = false;
+        browserReady = false;
+        browser = null;
+        throw err;
+    }
+}
+
+let contextPool = null;
+
+async function prewarmContextPool() {
+    if (contextPool || !browserReady || !browser) return;
+    try {
+        const ctx = await browser.newContext({
+            viewport: { width: 1920, height: 1080 },
+            deviceScaleFactor: 1,
+            userAgent: DEFAULT_UA,
+            locale: 'en-US',
+            timezoneId: 'Europe/London',
+            acceptDownloads: true
+        });
+
+        // Attach security, cursor, and clipboard hooks prior to pre-warming page
+        await attachContextBindings(ctx);
+
+        const page = await ctx.newPage();
+        const client = await ctx.newCDPSession(page);
+        await Promise.all([
+            client.send('Page.enable'),
+            client.send('DOM.enable'),
+            client.send('Overlay.enable').catch(() => {})
+        ]);
+
+        page.goto('https://www.google.com').catch(() => {});
+        contextPool = { context: ctx, page, client };
+        console.log('[pool] Pre-warmed context ready.');
+    } catch (e) {
+        console.warn('[pool] Pre-warm failed:', e.message);
+        contextPool = null;
+    }
+}
+
+async function attachContextBindings(ctx) {
+    try {
+        await ctx.exposeBinding('__reportCursor', (source, cursor) => {
+            const ws = ctx._ownerWs;
+            if (!ws || source.page.isClosed()) return;
+            const tab = Array.from(ws.tabs.values()).find((t) => t.page === source.page);
+            if (tab && ws.activeTabId && ws.tabs.get(ws.activeTabId) === tab && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'cursor', cursor }));
+            }
+        });
+    } catch (_) {}
+
+    try {
+        await ctx.exposeBinding('__reportCopy', (source, text) => {
+            const ws = ctx._ownerWs;
+            if (!ws || source.page.isClosed() || ws.readyState !== WebSocket.OPEN) return;
+            ws.send(JSON.stringify({ type: 'clipboard', text: String(text || '').slice(0, 100_000) }));
+        });
+    } catch (_) {}
+
+    try {
+        await ctx.addInitScript(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+            document.addEventListener('mouseover', (e) => {
+                try {
+                    const c = window.getComputedStyle(e.target).cursor;
+                    if (window.__reportCursor) window.__reportCursor(c);
+                } catch (_) {}
+            }, { passive: true, capture: true });
+
+            document.addEventListener('copy', () => {
+                try {
+                    const selected = window.getSelection().toString();
+                    if (selected && window.__reportCopy) window.__reportCopy(selected);
+                } catch (_) {}
+            }, { passive: true, capture: true });
+        });
+    } catch (_) {}
+}
+
+startBrowser().catch((err) => {
+    console.error('[!] Initial browser start failed, will retry on connection:', err.message);
+});
+
+// ---------- WebSocket Server & Connection Management ----------
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true, maxPayload: Math.max(MAX_UPLOAD_BYTES * 2, 2 * 1024 * 1024) });
 
-const WS_MSG_LIMIT = 600;
+const WS_MSG_LIMIT = 800;
 const WS_MSG_WINDOW = 10_000;
 
 server.on('upgrade', (request, socket, head) => {
     const ip = getClientIp(request);
+
+    // CRITICAL: Prevent Cross-Site WebSocket Hijacking (CSWSH)
+    if (!validateOrigin(request)) {
+        securityLog({ event: 'cswsh_blocked', ip, origin: request.headers.origin || 'none' });
+        socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+    }
+
     const rawToken = extractRawToken(request);
     const tokenHash = rawToken ? hashToken(rawToken) : null;
     const tokenData = tokenHash ? validTokens.get(tokenHash) : null;
@@ -638,11 +849,6 @@ server.on('upgrade', (request, socket, head) => {
     });
 });
 
-let browser = null;
-let adblocker = null;
-let browserStarting = false;
-let browserReady = false;
-
 function sendFrameToClient(ws, data) {
     if (ws.readyState !== WebSocket.OPEN) return;
 
@@ -665,7 +871,6 @@ function sendFrameToClient(ws, data) {
             }
         }, 1500);
     } else {
-        // Drop intermediate frames — keep only the newest
         ws.lastFrameData = data;
         ws.droppedFrames = (ws.droppedFrames || 0) + 1;
     }
@@ -689,8 +894,8 @@ async function startScreencast(client, ws) {
     const everyNthFrame = ws?.frameInFlight ? 2 : 1;
     const params = {
         format,
-        maxWidth: 1920,
-        maxHeight: 1080,
+        maxWidth: ws?.viewportWidth || 1920,
+        maxHeight: ws?.viewportHeight || 1080,
         everyNthFrame
     };
     if (format === 'jpeg') params.quality = quality;
@@ -708,19 +913,20 @@ async function renderErrorPage(page, url, errorMessage) {
     const errorHtml = `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Navigation Error</title>
 <style>
-body{background:#0f172a;color:#f8fafc;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;padding:20px}
-.container{max-width:500px;text-align:center;background:#1e293b;border:1px solid #334155;border-radius:12px;padding:32px}
+body{background:#0f172a;color:#f8fafc;font-family:system-ui,-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;padding:20px;box-sizing:border-box}
+.container{max-width:520px;width:100%;text-align:center;background:#1e293b;border:1px solid #334155;border-radius:12px;padding:32px;box-shadow:0 10px 25px rgba(0,0,0,0.5)}
 h1{font-size:22px;margin:0 0 12px;color:#ef4444}
 p{font-size:14px;color:#94a3b8;line-height:1.6;word-break:break-word}
-.url{font-family:monospace;background:#0f172a;padding:6px 10px;border-radius:6px;margin:16px 0}
-.btn{background:#3b82f6;color:#fff;border:none;border-radius:6px;padding:10px 20px;font-size:14px;font-weight:600;cursor:pointer;margin-top:16px}
+.url{font-family:monospace;background:#0f172a;padding:8px 12px;border-radius:6px;margin:16px 0;border:1px solid rgba(255,255,255,0.06)}
+.btn{background:#3b82f6;color:#fff;border:none;border-radius:6px;padding:10px 22px;font-size:14px;font-weight:600;cursor:pointer;margin-top:16px;transition:background 0.2s}
+.btn:hover{background:#2563eb}
 </style></head>
 <body><div class="container">
 <h1>Navigation Failed</h1>
-<p>The virtual browser was unable to load the requested website:</p>
+<p>The virtual browser was unable to load the requested page:</p>
 <div class="url">${safeUrl}</div>
-<p><strong>Error:</strong> ${safeErr}</p>
-<button class="btn" id="retry">Retry</button>
+<p><strong>Reason:</strong> ${safeErr}</p>
+<button class="btn" id="retry">Retry Navigation</button>
 </div>
 <script>
 document.getElementById('retry').addEventListener('click', function () {
@@ -736,6 +942,9 @@ async function createTab(ws, existingPage = null, existingClient = null) {
         if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'error', error: `Tab limit reached (${MAX_TABS_PER_SESSION}). Close a tab first.` }));
         }
+        if (existingPage && !existingPage.isClosed()) {
+            await existingPage.close().catch(() => {});
+        }
         return null;
     }
 
@@ -749,9 +958,40 @@ async function createTab(ws, existingPage = null, existingClient = null) {
         } catch (_) {}
     }, targetUA).catch(() => {});
 
+    // SSRF In-page route protection: prevent scripts from accessing private addresses
+    if (!ALLOW_PRIVATE_NAV) {
+        await page.route('**/*', (route) => {
+            try {
+                const reqUrl = new URL(route.request().url());
+                if (isPrivateOrBlockedHost(reqUrl.hostname)) {
+                    return route.abort();
+                }
+            } catch {
+                return route.abort();
+            }
+            route.continue();
+        }).catch(() => {});
+    }
+
     if (adblocker && ws.adblockerEnabled) {
         await adblocker.enableBlockingInPage(page).catch(() => {});
     }
+
+    // Handle Page Dialogs (alerts, confirms, prompts) so the browser engine never hangs
+    page.on('dialog', async (dialog) => {
+        page._pendingDialog = dialog;
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'dialog',
+                tabId,
+                message: dialog.message(),
+                dialogType: dialog.type(),
+                defaultValue: dialog.defaultValue()
+            }));
+        } else {
+            await dialog.dismiss().catch(() => {});
+        }
+    });
 
     page.on('domcontentloaded', () => {
         if (tabId === ws.activeTabId && ws.readyState === WebSocket.OPEN) {
@@ -771,14 +1011,23 @@ async function createTab(ws, existingPage = null, existingClient = null) {
 
     page.on('download', async (download) => {
         try {
-            const { safe, resolved } = resolveInsideDir(downloadsDir, download.suggestedFilename());
+            const rawName = download.suggestedFilename();
+            const safeName = sanitizeDownloadName(rawName);
+            const fileId = crypto.randomBytes(6).toString('hex');
+            const storedName = `${fileId}_${safeName}`;
+            const resolved = path.resolve(downloadsDir, storedName);
+
+            if (!resolved.startsWith(path.resolve(downloadsDir) + path.sep)) {
+                throw new Error('Invalid download path');
+            }
+
             await download.saveAs(resolved);
-            console.log(`[download] Saved: ${safe}`);
+            console.log(`[download] Saved: ${safeName} (${storedName})`);
             if (ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
                     type: 'download_ready',
-                    filename: safe,
-                    url: `/downloads/${encodeURIComponent(safe)}`
+                    filename: safeName,
+                    url: `/downloads/${encodeURIComponent(storedName)}`
                 }));
             }
         } catch (err) {
@@ -819,8 +1068,21 @@ async function createTab(ws, existingPage = null, existingClient = null) {
         } catch (_) {}
     });
 
+    // Handle Page Close event (e.g. window.close() invoked by target site)
+    page.on('close', () => {
+        if (ws.tabs.has(tabId)) {
+            closeTab(ws, tabId).catch(() => {});
+        }
+    });
+
     const client = existingClient || await page.context().newCDPSession(page);
-    if (!existingClient) await client.send('Page.enable');
+    if (!existingClient) {
+        await Promise.all([
+            client.send('Page.enable'),
+            client.send('DOM.enable'),
+            client.send('Overlay.enable').catch(() => {})
+        ]);
+    }
 
     const currentUrl = page.url() || 'about:blank';
     ws.tabs.set(tabId, {
@@ -829,7 +1091,9 @@ async function createTab(ws, existingPage = null, existingClient = null) {
         title: currentUrl.includes('google') ? 'Google' : 'New Tab',
         url: currentUrl,
         favicon: '',
-        searchId: null
+        searchId: null,
+        searchCount: 0,
+        searchIndex: 0
     });
 
     page.on('framenavigated', (frame) => {
@@ -847,7 +1111,6 @@ async function createTab(ws, existingPage = null, existingClient = null) {
             }))
             .then((fav) => {
                 if (!t) return;
-                // Only keep same-origin-friendly Google favicon helper URLs or blank (CSP)
                 try {
                     if (!fav) { t.favicon = ''; return; }
                     const host = new URL(fav, t.url).hostname;
@@ -929,7 +1192,8 @@ async function closeTab(ws, tabId) {
 
     if (ws.activeTabId === tabId) {
         if (ws.tabs.size > 0) {
-            await switchTab(ws, Array.from(ws.tabs.keys()).pop());
+            const nextTabId = Array.from(ws.tabs.keys()).pop();
+            await switchTab(ws, nextTabId);
         } else {
             ws.activeTabId = null;
             sendTabState(ws);
@@ -944,93 +1208,10 @@ async function closeTab(ws, tabId) {
     }
 }
 
-async function launchBrowserInstance() {
-    const launchArgs = [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-accelerated-2d-canvas',
-        '--enable-font-antialiasing',
-        '--font-render-hinting=medium',
-        '--force-color-profile=srgb'
-    ];
-
-    try {
-        console.log('[*] Launching Google Chrome channel...');
-        return await chromium.launch({ headless: true, channel: 'chrome', args: launchArgs });
-    } catch (err) {
-        console.warn('[!] Chrome channel unavailable, falling back to Chromium:', err.message);
-        return await chromium.launch({ headless: true, args: launchArgs });
-    }
-}
-
-async function startBrowser() {
-    if (browserReady || browserStarting) return;
-    browserStarting = true;
-
-    try {
-        console.log('[*] Initializing browser...');
-        browser = await launchBrowserInstance();
-        browserReady = true;
-        browserStarting = false;
-        console.log('[*] Browser engine ready.');
-        prewarmContextPool().catch(() => {});
-
-        const cacheDir = path.join(__dirname, 'adblocker_cache');
-        fs.mkdirSync(cacheDir, { recursive: true });
-        const cachePath = path.join(cacheDir, 'adblocker.bin');
-
-        PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch, {
-            path: cachePath,
-            read: async (p) => fs.promises.readFile(p),
-            write: async (p, content) => fs.promises.writeFile(p, content)
-        }).then((loadedBlocker) => {
-            adblocker = loadedBlocker;
-            console.log('[*] Adblocker rules ready.');
-        }).catch((e) => {
-            console.warn('[!] Adblocker background load warning:', e.message);
-        });
-    } catch (err) {
-        browserStarting = false;
-        throw err;
-    }
-}
-
-let contextPool = null;
-
-async function prewarmContextPool() {
-    if (contextPool || !browserReady) return;
-    try {
-        const ctx = await browser.newContext({
-            viewport: { width: 1920, height: 1080 },
-            deviceScaleFactor: 1,
-            userAgent: DEFAULT_UA,
-            locale: 'en-US',
-            timezoneId: 'Europe/London',
-            acceptDownloads: true
-        });
-        const page = await ctx.newPage();
-        const client = await ctx.newCDPSession(page);
-        await client.send('Page.enable');
-        page.goto('https://www.google.com').catch(() => {});
-        contextPool = { context: ctx, page, client };
-        console.log('[pool] Pre-warmed context ready.');
-    } catch (e) {
-        console.warn('[pool] Pre-warm failed:', e.message);
-        contextPool = null;
-    }
-}
-
-startBrowser().catch((err) => {
-    console.error('[!] Pre-warm failed, will retry on first connection:', err.message);
-});
-
 async function initBrowserContext(ws) {
     if (ws.context) {
         for (const tabId of [...ws.tabs.keys()]) ws.tabs.delete(tabId);
         ws.activeTabId = null;
-        ws.tabCounter = 0;
         await ws.context.close().catch(() => {});
         ws.context = null;
     }
@@ -1040,17 +1221,29 @@ async function initBrowserContext(ws) {
     const ua = ws.currentUserAgent || DEFAULT_UA;
     const isMobile = ws.isMobileUa === true;
 
+    ws.viewportWidth = isMobile ? 390 : 1920;
+    ws.viewportHeight = isMobile ? 844 : 1080;
+
+    // Send viewport resolution to client so coordinate mapping is exact
+    if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'viewport_dimensions',
+            width: ws.viewportWidth,
+            height: ws.viewportHeight,
+            isMobile
+        }));
+    }
+
     if (!needsProxy && !isMobile && ua === DEFAULT_UA && contextPool) {
         console.log('[pool] Handing off pre-warmed context.');
         ws.context = contextPool.context;
+        ws.context._ownerWs = ws;
         prewarmed = { page: contextPool.page, client: contextPool.client };
         contextPool = null;
         prewarmContextPool().catch((e) => console.warn('[pool] Re-warm failed:', e.message));
     } else {
         const contextOptions = {
-            viewport: isMobile
-                ? { width: 390, height: 844 }
-                : { width: 1920, height: 1080 },
+            viewport: { width: ws.viewportWidth, height: ws.viewportHeight },
             deviceScaleFactor: isMobile ? 3 : 1,
             userAgent: ua,
             locale: 'en-US',
@@ -1069,41 +1262,22 @@ async function initBrowserContext(ws) {
         }
 
         ws.context = await browser.newContext(contextOptions);
+        ws.context._ownerWs = ws;
+        await attachContextBindings(ws.context);
     }
 
-    try {
-        await ws.context.exposeBinding('__reportCursor', (source, cursor) => {
-            if (source.page.isClosed()) return;
-            const tab = Array.from(ws.tabs.values()).find((t) => t.page === source.page);
-            if (tab && ws.activeTabId && ws.tabs.get(ws.activeTabId) === tab && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'cursor', cursor }));
+    // Critical: Listen for new pages / popups (target="_blank" or window.open)
+    ws.context.on('page', async (newPage) => {
+        try {
+            console.log('[popup] Detected new window/popup');
+            const newTabId = await createTab(ws, newPage);
+            if (newTabId) {
+                await switchTab(ws, newTabId);
             }
-        });
-    } catch (_) {}
-
-    try {
-        await ws.context.exposeBinding('__reportCopy', (source, text) => {
-            if (source.page.isClosed() || ws.readyState !== WebSocket.OPEN) return;
-            ws.send(JSON.stringify({ type: 'clipboard', text: String(text || '').slice(0, 100_000) }));
-        });
-    } catch (_) {}
-
-    try {
-        await ws.context.addInitScript(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-            document.addEventListener('mouseover', (e) => {
-                try { window.__reportCursor(window.getComputedStyle(e.target).cursor); } catch (_) {}
-            }, { passive: true, capture: true });
-
-            document.addEventListener('copy', () => {
-                try {
-                    const selected = window.getSelection().toString();
-                    if (selected) window.__reportCopy(selected);
-                } catch (_) {}
-            }, { passive: true, capture: true });
-        });
-    } catch (_) {}
+        } catch (e) {
+            console.warn('[popup] Failed to handle popup page:', e.message);
+        }
+    });
 
     return prewarmed;
 }
@@ -1130,12 +1304,12 @@ wss.on('connection', async (ws) => {
     }
 
     if (activeSockets.size >= MAX_WS_SESSIONS) {
-        ws.close(1013, 'Too many sessions');
+        ws.close(1013, 'Too many active sessions');
         return;
     }
 
     activeSockets.add(ws);
-    console.log(`[+] Client connected (${activeSockets.size} active)`);
+    console.log(`[+] Client connected (${activeSockets.size} active sessions)`);
 
     ws.frameInFlight = false;
     ws.lastFrameData = null;
@@ -1150,6 +1324,8 @@ wss.on('connection', async (ws) => {
     ws.vpnEnabled = false;
     ws.isMuted = false;
     ws.zoomFactor = 1;
+    ws.viewportWidth = 1920;
+    ws.viewportHeight = 1080;
 
     let waited = 0;
     while (browserStarting && waited < 60_000) {
@@ -1157,12 +1333,12 @@ wss.on('connection', async (ws) => {
         waited += 250;
     }
 
-    if (!browserReady) {
+    if (!browserReady || !browser) {
         try {
             await startBrowser();
         } catch (err) {
             console.error('[!] startBrowser failed:', err.message);
-            ws.close(1011, 'Browser failed to start');
+            ws.close(1011, 'Browser engine failed to start');
             return;
         }
     }
@@ -1204,10 +1380,13 @@ wss.on('connection', async (ws) => {
         try {
             if (!msg || typeof msg.type !== 'string') return;
 
+            const vw = ws.viewportWidth || 1920;
+            const vh = ws.viewportHeight || 1080;
+
             if (msg.type === 'mousemove' || msg.type === 'mousedown' || msg.type === 'mouseup') {
                 if (typeof msg.x !== 'number' || typeof msg.y !== 'number') return;
-                msg.x = Math.max(0, Math.min(1920, Math.round(msg.x)));
-                msg.y = Math.max(0, Math.min(1080, Math.round(msg.y)));
+                msg.x = Math.max(0, Math.min(vw, Math.round(msg.x)));
+                msg.y = Math.max(0, Math.min(vh, Math.round(msg.y)));
                 if (msg.button && !['left', 'middle', 'right'].includes(msg.button)) return;
             } else if (msg.type === 'wheel') {
                 if (typeof msg.deltaX !== 'number' || typeof msg.deltaY !== 'number') return;
@@ -1219,7 +1398,7 @@ wss.on('connection', async (ws) => {
             } else if (msg.type === 'goto' || msg.type === 'new_tab') {
                 if (msg.url && (typeof msg.url !== 'string' || msg.url.length > 2048)) return;
             } else if (msg.type === 'type') {
-                if (typeof msg.text !== 'string' || msg.text.length > 10000) return;
+                if (typeof msg.text !== 'string' || msg.text.length > 25000) return;
             } else if (msg.type === 'switch_tab' || msg.type === 'close_tab') {
                 if (typeof msg.tabId !== 'string' || !/^tab_\d+$/.test(msg.tabId)) return;
             } else if (msg.type === 'toggle_adblocker' || msg.type === 'toggle_vpn') {
@@ -1244,12 +1423,14 @@ wss.on('connection', async (ws) => {
                 if (typeof msg.query !== 'string' || msg.query.length > 512) return;
             } else if (msg.type === 'find_next') {
                 if (typeof msg.forward !== 'boolean') return;
+            } else if (msg.type === 'dialog_response') {
+                if (typeof msg.accept !== 'boolean') return;
             }
         } catch {
             return;
         }
 
-        // Refresh session activity
+        // Refresh session activity timestamp
         if (ws.tokenHash) {
             const meta = validTokens.get(ws.tokenHash);
             if (!isTokenValid(meta)) {
@@ -1289,6 +1470,7 @@ wss.on('connection', async (ws) => {
                 }
                 return;
             }
+
             if (msg.type === 'switch_tab') { await switchTab(ws, msg.tabId); return; }
             if (msg.type === 'close_tab') { await closeTab(ws, msg.tabId); return; }
 
@@ -1370,6 +1552,27 @@ wss.on('connection', async (ws) => {
                     ws.activeFileChooser = null;
                 } catch (err) {
                     console.error('[upload] Failed:', err.message);
+                }
+                return;
+            }
+
+            if (msg.type === 'file_chooser_cancel') {
+                ws.activeFileChooser = null;
+                return;
+            }
+
+            if (msg.type === 'dialog_response') {
+                if (ws.activeTabId && ws.tabs.has(ws.activeTabId)) {
+                    const page = ws.tabs.get(ws.activeTabId).page;
+                    if (page._pendingDialog) {
+                        const d = page._pendingDialog;
+                        page._pendingDialog = null;
+                        if (msg.accept) {
+                            await d.accept(msg.promptText ? String(msg.promptText).slice(0, 1000) : undefined).catch(() => {});
+                        } else {
+                            await d.dismiss().catch(() => {});
+                        }
+                    }
                 }
                 return;
             }
@@ -1557,7 +1760,8 @@ wss.on('connection', async (ws) => {
                     break;
                 }
                 case 'type':
-                    p.keyboard.type(msg.text).catch(() => {});
+                    // CRITICAL FIX: insertText eliminates key event starvation and form Enter submission bugs
+                    p.keyboard.insertText(msg.text).catch(() => {});
                     break;
                 case 'back':
                     p.goBack().catch(() => {});
@@ -1576,12 +1780,15 @@ wss.on('connection', async (ws) => {
 
     ws.on('close', async () => {
         activeSockets.delete(ws);
-        console.log(`[-] Client disconnected (${activeSockets.size} active)`);
+        console.log(`[-] Client disconnected (${activeSockets.size} active sessions)`);
         if (ws.ackTimeout) {
             clearTimeout(ws.ackTimeout);
             ws.ackTimeout = null;
         }
-        if (ws.context) await ws.context.close().catch(() => {});
+        if (ws.context) {
+            await ws.context.close().catch(() => {});
+            ws.context = null;
+        }
     });
 
     ws.on('error', (err) => {
@@ -1590,5 +1797,5 @@ wss.on('connection', async (ws) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`[*] Virtual Browser listening on 0.0.0.0:${PORT}`);
+    console.log(`[*] MSuite-Browser listening on 0.0.0.0:${PORT}`);
 });

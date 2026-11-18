@@ -1,94 +1,137 @@
-# Virtual Browser (BrowserBox Alternative)
+# MSuite-Browser: Debian 13 Virtual Browser
 
-A secure, performant Remote Browser Isolation (RBI) tool built with Node.js and Playwright.
+A secure, high-performance Remote Browser Isolation (RBI) tool built with Node.js, Playwright, and WebSockets.
 
-> **Security note:** Designed for **single-tenant** use behind HTTPS. All clients share one Chromium process with per-connection BrowserContexts. Do not expose an unauthenticated or default-password instance to the internet.
+> **Security Note:** Designed for single-tenant use behind HTTPS. Client sessions run inside per-connection isolated `BrowserContext` instances. Never expose an unauthenticated or default-password instance to the public internet.
 
-## Features
-- **Endpoint isolation:** Page code runs on the remote server, not the operator device.
-- **Multi-tab support** with capped tabs per session.
-- **Ad & tracker blocking** via Ghostery (Playwright).
-- **Cookie-based session auth** (HttpOnly) + idle/absolute token expiry.
-- **Authenticated downloads** with sanitized filenames.
-- **Optional Cloudflare WARP VPN** (userspace SOCKS5) and custom proxies.
-- **Full input passthrough** for mouse, keyboard, and common shortcuts.
+---
 
-## Install / update (Debian/Ubuntu)
+## Architecture & Features
 
-### If the GitHub repo is **private** (current default)
+- **Endpoint Isolation:** Target website code executes inside an isolated container on the remote Debian server. Only encrypted frame streams and user input are exchanged.
+- **Cross-Site WebSocket Hijacking (CSWSH) Defense:** Strict origin and host validation on WebSocket upgrade and API authentication.
+- **SSRF & Private Network Mitigation:** Enforces strict boundary checks blocking internal addresses, loopbacks, link-local addresses, and cloud provider metadata endpoints (`ALLOW_PRIVATE_NAV=0`).
+- **Dynamic Viewport & Touchscreen Support:** Real-time coordinate mapping for desktop (1920x1080) and mobile (390x844) viewport profiles, with native touch/swipe support on phones and tablets.
+- **Popup & New Window Handling:** Seamlessly intercepts and manages `target="_blank"` popups and `window.open()` calls into tabbed sessions.
+- **Interactive JavaScript Dialogs:** Captures and presents remote `alert()`, `confirm()`, and `prompt()` modals without freezing browser execution.
+- **Ad & Tracker Defense:** Built-in ad and tracker blocking powered by `@ghostery/adblocker-playwright`.
+- **Integrated SOCKS5 / WARP Routing:** Optional userspace Cloudflare WARP client or custom SOCKS5/HTTP proxy support.
+- **Synchronized Clipboard & File Handling:** Instantaneous text insertion (`insertText`) and sanitized file uploads and downloads.
 
-Unauthenticated `wget`/`curl` to `raw.githubusercontent.com` will download `404: Not Found` and the installer cannot run. Use git with credentials instead:
+---
+
+## Quick Install (Debian 13 / Debian 12 / Ubuntu)
+
+### Automated Install
+
+Clone the repository and run the installer:
 
 ```bash
-# First time
-git clone https://github.com/merlinthedev848/browser.git virtual-browser
-cd virtual-browser
+git clone https://github.com/merlinthedev848/MSuite-Browser.git msuite-browser
+cd msuite-browser
 chmod +x install.sh
 ./install.sh
-
-# Later updates (from inside the clone, or let install.sh reset --hard origin/main)
-cd virtual-browser
-git fetch origin main && git reset --hard origin/main
-./install.sh
 ```
 
-Or with a Personal Access Token:
+Or execute the setup script directly:
 
 ```bash
-curl -fsSL -H "Authorization: Bearer YOUR_GH_PAT" \
-  https://raw.githubusercontent.com/merlinthedev848/browser/main/install.sh \
-  -o install.sh
+curl -fsSL https://raw.githubusercontent.com/merlinthedev848/MSuite-Browser/main/install.sh -o install.sh
 chmod +x install.sh && ./install.sh
 ```
 
-### If you make the repo **public**
+The installer verifies prerequisites, prompts for a strong session password (min 8 characters), builds the Docker container, and launches the service.
 
-Then the classic one-liner works:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/merlinthedev848/browser/main/install.sh -o install.sh
-chmod +x install.sh && ./install.sh
-```
-
-(`curl ... | bash` also works once public; prefer saving the script first so a 404 cannot be executed.)
-
-The script **requires** a strong password (8+ chars, not `password123`). Existing `vbrowser` container passwords are reused when present.
+---
 
 ## Manual Docker Deployment
 
 ```bash
-git clone https://github.com/merlinthedev848/browser.git
-cd browser
-mkdir -p browser_data && chmod 700 browser_data
-docker build -t virtual-browser .
+git clone https://github.com/merlinthedev848/MSuite-Browser.git
+cd MSuite-Browser
+mkdir -p browser_data/downloads && chmod 700 browser_data
+
+# Build image
+docker build -t msuite-browser .
+
+# Run container
 docker run -d \
   -p 3000:3000 \
   -e PASSWORD="your_strong_password_here" \
+  -e TRUST_PROXY=0 \
   -v "$(pwd)/browser_data:/usr/src/app/browser_data" \
-  --shm-size 1g \
-  --name vbrowser \
+  --shm-size 2g \
+  --name msuite-browser \
   --restart unless-stopped \
-  virtual-browser
+  msuite-browser
 ```
 
-### Important environment variables
+---
+
+## Configuration & Environment Variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `PASSWORD` | _(required)_ | Login password (not `password123`, min 8 chars) |
-| `TRUST_PROXY` | `0` | Set `1` behind a trusted reverse proxy |
-| `ALLOW_PRIVATE_NAV` | `0` | Set `1` to allow localhost/RFC1918 navigation |
-| `MAX_TABS` | `8` | Max tabs per WebSocket session |
-| `MAX_WS_SESSIONS` | `6` | Max concurrent browser sessions |
-| `IDLE_TTL_MS` | `7200000` | Idle session expiry (2h) |
-| `ENABLE_WARP` | `1` | Set `0` to skip WARP in entrypoint |
+| `PASSWORD` | _(required)_ | Authentication password (minimum 8 characters, not `password123`) |
+| `TRUST_PROXY` | `0` | Set to `1` when running behind a trusted reverse proxy (Nginx, Caddy, Traefik) |
+| `ALLOW_PRIVATE_NAV` | `0` | Set to `1` to allow navigation and subresources to RFC1918 / localhost addresses |
+| `MAX_TABS` | `8` | Maximum concurrent tabs per session |
+| `MAX_WS_SESSIONS` | `6` | Maximum concurrent WebSocket client sessions |
+| `MAX_UPLOAD_BYTES` | `8388608` | Maximum file upload size in bytes (8 MB) |
+| `IDLE_TTL_MS` | `7200000` | Idle session expiry (2 hours) |
+| `TOKEN_TTL_MS` | `43200000` | Absolute token lifetime (12 hours) |
+| `ENABLE_WARP` | `1` | Enable/disable Cloudflare WARP userspace SOCKS5 daemon (`amd64`) |
+| `ABUSEIPDB_KEY` | `null` | Optional AbuseIPDB API key for automatic threat blocking and reporting |
 
-### Production
+---
 
-Always terminate TLS with Nginx or Caddy, enable WebSocket upgrades, forward `X-Forwarded-Proto`, and set `TRUST_PROXY=1`.
+## Production Reverse Proxy Setup
 
-Health check: `GET /healthz`.
+Always terminate TLS at your reverse proxy and forward WebSocket upgrade headers. Set `TRUST_PROXY=1` in your container environment.
 
-### Persistence
+### Nginx Configuration
 
-Auth sessions (hashed tokens) persist under `browser_data/sessions.json`. **Site cookies are not persisted** across disconnects — each WebSocket gets a fresh BrowserContext by design.
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name browser.example.com;
+
+    ssl_certificate     /etc/ssl/certs/browser.crt;
+    ssl_certificate_key /etc/ssl/private/browser.key;
+
+    client_max_body_size 16M;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+}
+```
+
+### Caddy Configuration
+
+```caddy
+browser.example.com {
+    reverse_proxy 127.0.0.1:3000 {
+        header_up Host {host}
+        header_up X-Forwarded-Host {host}
+    }
+}
+```
+
+---
+
+## Health Checks & Persistence
+
+- **Health Check Endpoint:** `GET /healthz` (returns `200 OK` when browser engine is operational; `503 Service Unavailable` during startup or engine recovery).
+- **Session Persistence:** Hashed authentication tokens persist in `browser_data/sessions.json`.
+- **Downloads Directory:** Downloaded files are stored with unique, collision-proof identifiers under `browser_data/downloads` and automatically purged after 24 hours.

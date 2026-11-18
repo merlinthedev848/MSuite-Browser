@@ -1,12 +1,13 @@
 #!/bin/sh
-# entrypoint.sh — Optionally bootstrap Cloudflare WARP (SOCKS5), then start the app.
+# entrypoint.sh — MSuite-Browser: Bootstrap WARP (SOCKS5) and start application server.
+set -e
 
 WARP_PROXY_PORT=40000
 WARP_READY=0
 ENABLE_WARP="${ENABLE_WARP:-1}"
 
-if [ -z "${PASSWORD:-}" ] || [ "$PASSWORD" = "password123" ]; then
-    echo "[FATAL] PASSWORD env var must be set to a non-default value (8+ chars)."
+if [ -z "${PASSWORD:-}" ] || [ "$PASSWORD" = "password123" ] || [ "${#PASSWORD}" -lt 8 ]; then
+    echo "[FATAL] PASSWORD env var must be set to a non-default value (8+ characters, not password123)."
     exit 1
 fi
 
@@ -45,5 +46,5 @@ else
     echo "[warp] Skipped (ENABLE_WARP=$ENABLE_WARP or warp not installed)."
 fi
 
-echo "[app] Starting Virtual Browser server..."
+echo "[app] Starting MSuite-Browser server..."
 exec node /usr/src/app/server.js
