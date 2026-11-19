@@ -853,6 +853,11 @@ body {
     color: #fde68a;
 }
 
+.console-row.adblock-log {
+    background: rgba(59, 130, 246, 0.08);
+    color: #93c5fd;
+}
+
 .console-empty, .network-empty {
     color: var(--text-muted);
     padding: 16px;

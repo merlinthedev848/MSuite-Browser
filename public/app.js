@@ -1159,24 +1159,33 @@ function handleConsoleLog(msg) {
     const empty = consoleLogs.querySelector('.console-empty');
     if (empty) empty.remove();
 
+    const isAdBlocked = msg.text && msg.text.includes('ERR_BLOCKED_BY_CLIENT');
     consoleEntries.push(msg);
     consoleCount.textContent = String(consoleEntries.length);
 
-    if (devtoolsDrawer.classList.contains('hidden')) {
-        devtoolsBadge.classList.remove('hidden');
-        devtoolsBadge.textContent = String(Math.min(99, consoleEntries.length));
+    if (devtoolsDrawer.classList.contains('hidden') && !isAdBlocked) {
+        const errorCount = consoleEntries.filter(e => e.level === 'error' && !e.text?.includes('ERR_BLOCKED_BY_CLIENT')).length;
+        if (errorCount > 0) {
+            devtoolsBadge.classList.remove('hidden');
+            devtoolsBadge.textContent = String(Math.min(99, errorCount));
+        }
     }
 
     const row = document.createElement('div');
-    row.className = `console-row ${msg.level || 'info'}`;
-
     const icon = document.createElement('span');
     icon.className = 'console-icon';
-    icon.textContent = msg.level === 'error' ? '❌' : (msg.level === 'warn' ? '⚠️' : 'ℹ️');
-
     const text = document.createElement('span');
     text.className = 'console-text';
-    text.textContent = msg.text || '';
+
+    if (isAdBlocked) {
+        row.className = 'console-row adblock-log';
+        icon.textContent = '🛡️';
+        text.textContent = msg.text.replace('net::ERR_BLOCKED_BY_CLIENT', 'net::ERR_BLOCKED_BY_CLIENT (Blocked by Ghostery Ad Blocker)');
+    } else {
+        row.className = `console-row ${msg.level || 'info'}`;
+        icon.textContent = msg.level === 'error' ? '❌' : (msg.level === 'warn' ? '⚠️' : 'ℹ️');
+        text.textContent = msg.text || '';
+    }
 
     row.appendChild(icon);
     row.appendChild(text);
