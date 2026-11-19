@@ -671,16 +671,20 @@ body {
     position: relative;
     outline: none;
     cursor: default;
-    background: #000;
+    background: #090d16;
     overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
 }
 
 .screencast-canvas {
     width: 100%;
     height: 100%;
-    object-fit: fill;
+    object-fit: contain;
     display: block;
     background: #000;
+    image-rendering: -webkit-optimize-contrast;
 }
 
 #interaction-overlay {

@@ -196,12 +196,24 @@ let zoomLevel = 1.0;
 let isMuted = false;
 let isDarkInverted = false;
 let selectedSearchEngine = localStorage.getItem('vb_search_engine') || 'google';
+let selectedDeviceMode = localStorage.getItem('vb_device_mode') || 'match';
 
 // Viewport & Resolution
 let remoteWidth = 1920;
 let remoteHeight = 1080;
 canvas.width = remoteWidth;
 canvas.height = remoteHeight;
+
+function syncViewportToContainer(force = false) {
+    if (selectedDeviceMode !== 'match') return;
+    const rect = viewportContainer.getBoundingClientRect();
+    if (!rect.width || !rect.height || rect.width < 200 || rect.height < 100) return;
+    const w = Math.round(rect.width);
+    const h = Math.round(rect.height);
+    if (force || Math.abs(w - remoteWidth) > 4 || Math.abs(h - remoteHeight) > 4) {
+        sendMsg({ type: 'set_viewport', width: w, height: h });
+    }
+}
 
 // Performance Metrics
 let frameCount = 0;
@@ -271,6 +283,8 @@ loginForm.addEventListener('submit', async (e) => {
             loginScreen.classList.add('hidden');
             appContainer.classList.remove('hidden');
             initApp();
+        setTimeout(() => syncViewportToContainer(true), 120);
+            setTimeout(() => syncViewportToContainer(true), 120);
         } else {
             const msg = String(data.error || 'Incorrect password').slice(0, 200);
             loginError.textContent = msg;
@@ -348,6 +362,7 @@ function connectWS() {
         hideOverlay();
         viewportContainer.classList.add('ready');
         sendMsg({ type: 'set_search_engine', engine: selectedSearchEngine });
+        syncViewportToContainer(true);
     };
 
     ws.onclose = (event) => {
@@ -665,14 +680,38 @@ function updateTabAudioIndicator(tabId, isPlaying) {
 
 newTabBtn.addEventListener('click', () => sendMsg({ type: 'new_tab' }));
 
-// ---------- Coordinate Mapping (Hardware Scaled Canvas) ----------
+// ---------- Coordinate Mapping (Aspect-Preserved Hardware Canvas) ----------
 function getMappedCoords(clientX, clientY) {
     const rect = overlay.getBoundingClientRect();
-    const scaleX = remoteWidth / rect.width;
-    const scaleY = remoteHeight / rect.height;
+    const cw = rect.width;
+    const ch = rect.height;
+    if (cw <= 0 || ch <= 0) return { x: 0, y: 0 };
 
-    const x = Math.round((clientX - rect.left) * scaleX);
-    const y = Math.round((clientY - rect.top) * scaleY);
+    const remoteRatio = remoteWidth / remoteHeight;
+    const containerRatio = cw / ch;
+
+    let renderW = cw;
+    let renderH = ch;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    if (containerRatio > remoteRatio) {
+        // Pillarboxing (black bars on left and right)
+        renderH = ch;
+        renderW = ch * remoteRatio;
+        offsetX = (cw - renderW) / 2;
+    } else if (containerRatio < remoteRatio) {
+        // Letterboxing (black bars on top and bottom)
+        renderW = cw;
+        renderH = cw / remoteRatio;
+        offsetY = (ch - renderH) / 2;
+    }
+
+    const mouseX = clientX - rect.left - offsetX;
+    const mouseY = clientY - rect.top - offsetY;
+
+    const x = Math.round((mouseX / renderW) * remoteWidth);
+    const y = Math.round((mouseY / renderH) * remoteHeight);
 
     return {
         x: Math.max(0, Math.min(remoteWidth, x)),
@@ -1023,7 +1062,7 @@ toolShortcuts.addEventListener('click', () => {
 
 shortcutsCloseBtn.addEventListener('click', () => shortcutsModal.classList.add('hidden'));
 
-// Device Presets
+// Device Presets & Viewport Scaling
 const DEVICE_RESOLUTIONS = {
     desktop: { width: 1920, height: 1080 },
     laptop: { width: 1366, height: 768 },
@@ -1032,19 +1071,24 @@ const DEVICE_RESOLUTIONS = {
     galaxy: { width: 412, height: 915 }
 };
 
+function updateDeviceMenuUI() {
+    document.querySelectorAll('#device-menu .dropdown-item').forEach(b => {
+        b.classList.toggle('active', b.dataset.device === selectedDeviceMode);
+    });
+}
+updateDeviceMenuUI();
+
 document.querySelectorAll('#device-menu .dropdown-item').forEach(btn => {
     btn.addEventListener('click', () => {
         const dev = btn.dataset.device;
-        document.querySelectorAll('#device-menu .dropdown-item').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
+        selectedDeviceMode = dev;
+        localStorage.setItem('vb_device_mode', dev);
+        updateDeviceMenuUI();
         deviceMenu.classList.add('hidden');
 
         if (dev === 'match') {
-            const vRect = viewportContainer.getBoundingClientRect();
-            const w = Math.round(vRect.width);
-            const h = Math.round(vRect.height);
-            sendMsg({ type: 'set_viewport', width: w, height: h });
-            showOverlay(`Matching window resolution (${w}x${h})...`);
+            syncViewportToContainer(true);
+            showOverlay('Auto-fitting resolution to client window...');
         } else if (DEVICE_RESOLUTIONS[dev]) {
             const res = DEVICE_RESOLUTIONS[dev];
             sendMsg({ type: 'set_viewport', width: res.width, height: res.height });
@@ -1052,6 +1096,20 @@ document.querySelectorAll('#device-menu .dropdown-item').forEach(btn => {
         }
     });
 });
+
+let resizeDebounce = null;
+const viewportResizeObserver = new ResizeObserver((entries) => {
+    if (selectedDeviceMode !== 'match') return;
+    for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        if (width < 320 || height < 200) continue;
+        clearTimeout(resizeDebounce);
+        resizeDebounce = setTimeout(() => {
+            syncViewportToContainer(false);
+        }, 150);
+    }
+});
+viewportResizeObserver.observe(viewportContainer);
 
 // ---------- DevTools & Remote Console ----------
 devtoolsBtn.addEventListener('click', () => {
@@ -1834,6 +1892,7 @@ function escapeHtml(value) {
         loginScreen.classList.add('hidden');
         appContainer.classList.remove('hidden');
         initApp();
+        setTimeout(() => syncViewportToContainer(true), 120);
     } catch (_) {
         sessionStorage.removeItem('vb_token');
     }

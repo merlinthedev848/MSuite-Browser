@@ -1547,6 +1547,14 @@ wss.on('connection', async (ws) => {
                         }
                     }
                 }
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'viewport_dimensions',
+                        width: ws.viewportWidth,
+                        height: ws.viewportHeight,
+                        isMobile: ws.isMobileUa === true
+                    }));
+                }
                 if (ws.activeTabId && ws.tabs.has(ws.activeTabId)) {
                     const t = ws.tabs.get(ws.activeTabId);
                     await stopScreencast(t.client);
