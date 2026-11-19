@@ -12,11 +12,11 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const PASSWORD = process.env.PASSWORD || '';
 const NODE_ENV = process.env.NODE_ENV || 'production';
 const ALLOW_PRIVATE_NAV = process.env.ALLOW_PRIVATE_NAV === '1';
-const MAX_TABS_PER_SESSION = parseInt(process.env.MAX_TABS || '8', 10);
-const MAX_WS_SESSIONS = parseInt(process.env.MAX_WS_SESSIONS || '6', 10);
-const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_BYTES || String(8 * 1024 * 1024), 10);
-const IDLE_TTL_MS = parseInt(process.env.IDLE_TTL_MS || String(2 * 60 * 60 * 1000), 10); // 2h idle
-const TOKEN_TTL_MS = parseInt(process.env.TOKEN_TTL_MS || String(12 * 60 * 60 * 1000), 10); // 12h absolute
+const MAX_TABS_PER_SESSION = parseInt(process.env.MAX_TABS || '12', 10);
+const MAX_WS_SESSIONS = parseInt(process.env.MAX_WS_SESSIONS || '8', 10);
+const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_BYTES || String(16 * 1024 * 1024), 10); // 16 MB
+const IDLE_TTL_MS = parseInt(process.env.IDLE_TTL_MS || String(4 * 60 * 60 * 1000), 10); // 4h idle
+const TOKEN_TTL_MS = parseInt(process.env.TOKEN_TTL_MS || String(24 * 60 * 60 * 1000), 10); // 24h absolute
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 
 const COOKIE_NAME = 'vb_session';
@@ -183,7 +183,6 @@ function validateOrigin(req) {
             return false;
         }
     }
-    // If neither origin nor referer is supplied on standard POST, reject unless disabled
     return process.env.ALLOW_EMPTY_ORIGIN === '1';
 }
 
@@ -194,7 +193,7 @@ const globalRateMap = new Map(); // ip -> { requests, windowStart }
 const activeSockets = new Set();
 
 const LOCKOUT_THRESHOLD = 5;
-const GLOBAL_REQ_LIMIT = 180;
+const GLOBAL_REQ_LIMIT = 240;
 const GLOBAL_REQ_WINDOW = 60_000;
 const MAX_ATTEMPTS_STORED = 5_000;
 const MAX_TOKENS_STORED = 500;
@@ -246,7 +245,7 @@ function saveSessions() {
 
 loadSessions();
 
-// Housekeeping interval: tokens, rate limiters, lockouts, stale downloads
+// Housekeeping interval
 setInterval(() => {
     const now = Date.now();
     let cleaned = false;
@@ -258,7 +257,6 @@ setInterval(() => {
     }
     if (cleaned) saveSessions();
 
-    // Reset login attempts if lockout expired by > 1 hour or non-locked attempts older than 1 hour
     for (const [ip, v] of loginAttempts) {
         if (v.lockUntil && now > v.lockUntil + 3_600_000) {
             loginAttempts.delete(ip);
@@ -271,7 +269,6 @@ setInterval(() => {
         if (now - v.windowStart > GLOBAL_REQ_WINDOW) globalRateMap.delete(ip);
     }
 
-    // Prune stale downloads older than 24 hours
     fs.readdir(downloadsDir, (err, files) => {
         if (err || !files) return;
         const cutoff = now - (24 * 60 * 60 * 1000);
@@ -365,27 +362,6 @@ async function checkAbuseIPDB(ip) {
     }
 }
 
-async function reportToAbuseIPDB(ip, comment) {
-    if (!ABUSEIPDB_KEY || isPrivateOrBlockedHost(ip)) return;
-    try {
-        const cleanIp = ip.replace(/^::ffff:/, '');
-        const body = new URLSearchParams({
-            ip: cleanIp,
-            categories: '18',
-            comment: comment.slice(0, 1024)
-        });
-        const res = await fetch('https://api.abuseipdb.com/api/v2/report', {
-            method: 'POST',
-            headers: { Key: ABUSEIPDB_KEY, 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: body.toString(),
-            signal: AbortSignal.timeout(8_000)
-        });
-        if (res.ok) console.log(`[abuseipdb] Reported ${cleanIp}.`);
-    } catch (e) {
-        console.warn(`[abuseipdb] Report failed for ${ip}: ${e.message}`);
-    }
-}
-
 async function isThreatIp(ip) {
     const plain = ip.replace(/^::ffff:/, '');
     if (publicBlocklist.has(plain)) {
@@ -408,7 +384,7 @@ async function isThreatIp(ip) {
 app.set('trust proxy', TRUST_PROXY ? 1 : false);
 app.use(express.json({ limit: '64kb' }));
 
-// Global Rate Limiting
+// Global Rate Limiter
 app.use((req, res, next) => {
     const ip = getClientIp(req);
     const now = Date.now();
@@ -445,7 +421,7 @@ app.use((req, res, next) => {
         "script-src 'self'",
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
         "font-src 'self' https://fonts.gstatic.com",
-        "img-src 'self' data: blob: https://www.google.com",
+        "img-src 'self' data: blob: https://www.google.com https://icons.duckduckgo.com",
         "connect-src 'self' ws: wss:",
         "object-src 'none'",
         "base-uri 'self'",
@@ -637,7 +613,6 @@ app.get('/api/session', (req, res) => {
     res.json({ authenticated: true });
 });
 
-// Express Error Handler Middleware
 app.use((err, req, res, _next) => {
     console.error('[express-error]', err.message);
     res.status(err.status || 500).json({ success: false, error: err.message || 'Internal server error' });
@@ -658,11 +633,14 @@ async function launchBrowserInstance() {
         '--disable-accelerated-2d-canvas',
         '--enable-font-antialiasing',
         '--font-render-hinting=medium',
-        '--force-color-profile=srgb'
+        '--force-color-profile=srgb',
+        '--disable-blink-features=AutomationControlled',
+        '--force-webrtc-ip-handling-policy=default_public_interface_only',
+        '--disable-features=IsolateOrigins,site-per-process'
     ];
 
     try {
-        console.log('[*] Launching Google Chrome channel...');
+        console.log('[*] Launching Google Chrome channel with anti-detection flags...');
         const inst = await chromium.launch({ headless: true, channel: 'chrome', args: launchArgs });
         inst.on('disconnected', () => {
             console.warn('[!] Browser process disconnected or crashed.');
@@ -733,7 +711,6 @@ async function prewarmContextPool() {
             acceptDownloads: true
         });
 
-        // Attach security, cursor, and clipboard hooks prior to pre-warming page
         await attachContextBindings(ctx);
 
         const page = await ctx.newPage();
@@ -774,6 +751,21 @@ async function attachContextBindings(ctx) {
     } catch (_) {}
 
     try {
+        await ctx.exposeBinding('__reportAudioState', (source, isPlaying) => {
+            const ws = ctx._ownerWs;
+            if (!ws || source.page.isClosed()) return;
+            const tabEntry = Array.from(ws.tabs.entries()).find(([_, t]) => t.page === source.page);
+            if (tabEntry) {
+                const [tabId, tab] = tabEntry;
+                tab.isPlayingAudio = !!isPlaying;
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'tab_audio_state', tabId, isPlayingAudio: tab.isPlayingAudio }));
+                }
+            }
+        });
+    } catch (_) {}
+
+    try {
         await ctx.addInitScript(() => {
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
@@ -790,6 +782,19 @@ async function attachContextBindings(ctx) {
                     if (selected && window.__reportCopy) window.__reportCopy(selected);
                 } catch (_) {}
             }, { passive: true, capture: true });
+
+            document.addEventListener('play', (e) => {
+                if (['VIDEO', 'AUDIO'].includes(e.target?.tagName) && window.__reportAudioState) {
+                    window.__reportAudioState(true);
+                }
+            }, { capture: true, passive: true });
+
+            document.addEventListener('pause', (e) => {
+                if (['VIDEO', 'AUDIO'].includes(e.target?.tagName) && window.__reportAudioState) {
+                    const anyPlaying = Array.from(document.querySelectorAll('video, audio')).some(el => !el.paused && !el.ended);
+                    window.__reportAudioState(anyPlaying);
+                }
+            }, { capture: true, passive: true });
         });
     } catch (_) {}
 }
@@ -800,15 +805,14 @@ startBrowser().catch((err) => {
 
 // ---------- WebSocket Server & Connection Management ----------
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ noServer: true, maxPayload: Math.max(MAX_UPLOAD_BYTES * 2, 2 * 1024 * 1024) });
+const wss = new WebSocket.Server({ noServer: true, maxPayload: Math.max(MAX_UPLOAD_BYTES * 2, 4 * 1024 * 1024) });
 
-const WS_MSG_LIMIT = 800;
+const WS_MSG_LIMIT = 1000;
 const WS_MSG_WINDOW = 10_000;
 
 server.on('upgrade', (request, socket, head) => {
     const ip = getClientIp(request);
 
-    // CRITICAL: Prevent Cross-Site WebSocket Hijacking (CSWSH)
     if (!validateOrigin(request)) {
         securityLog({ event: 'cswsh_blocked', ip, origin: request.headers.origin || 'none' });
         socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
@@ -869,7 +873,7 @@ function sendFrameToClient(ws, data) {
                 ws.lastFrameData = null;
                 sendFrameToClient(ws, nextData);
             }
-        }, 1500);
+        }, 1200);
     } else {
         ws.lastFrameData = data;
         ws.droppedFrames = (ws.droppedFrames || 0) + 1;
@@ -883,7 +887,8 @@ function sendTabState(ws) {
         title: t.title,
         url: t.url,
         favicon: t.favicon,
-        isActive: id === ws.activeTabId
+        isActive: id === ws.activeTabId,
+        isPlayingAudio: !!t.isPlayingAudio
     }));
     ws.send(JSON.stringify({ type: 'tab_state', tabs: tabList }));
 }
@@ -913,17 +918,17 @@ async function renderErrorPage(page, url, errorMessage) {
     const errorHtml = `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Navigation Error</title>
 <style>
-body{background:#0f172a;color:#f8fafc;font-family:system-ui,-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;padding:20px;box-sizing:border-box}
-.container{max-width:520px;width:100%;text-align:center;background:#1e293b;border:1px solid #334155;border-radius:12px;padding:32px;box-shadow:0 10px 25px rgba(0,0,0,0.5)}
-h1{font-size:22px;margin:0 0 12px;color:#ef4444}
+body{background:#0b1120;color:#f8fafc;font-family:system-ui,-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;padding:20px;box-sizing:border-box}
+.container{max-width:520px;width:100%;text-align:center;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:36px;box-shadow:0 15px 35px rgba(0,0,0,0.6)}
+h1{font-size:22px;margin:0 0 12px;color:#ef4444;font-weight:600}
 p{font-size:14px;color:#94a3b8;line-height:1.6;word-break:break-word}
-.url{font-family:monospace;background:#0f172a;padding:8px 12px;border-radius:6px;margin:16px 0;border:1px solid rgba(255,255,255,0.06)}
-.btn{background:#3b82f6;color:#fff;border:none;border-radius:6px;padding:10px 22px;font-size:14px;font-weight:600;cursor:pointer;margin-top:16px;transition:background 0.2s}
+.url{font-family:monospace;background:#0f172a;padding:8px 12px;border-radius:6px;margin:16px 0;border:1px solid rgba(255,255,255,0.06);font-size:13px}
+.btn{background:#3b82f6;color:#fff;border:none;border-radius:8px;padding:10px 24px;font-size:14px;font-weight:600;cursor:pointer;margin-top:16px;transition:background 0.2s}
 .btn:hover{background:#2563eb}
 </style></head>
 <body><div class="container">
 <h1>Navigation Failed</h1>
-<p>The virtual browser was unable to load the requested page:</p>
+<p>The isolated virtual browser was unable to load the requested page:</p>
 <div class="url">${safeUrl}</div>
 <p><strong>Reason:</strong> ${safeErr}</p>
 <button class="btn" id="retry">Retry Navigation</button>
@@ -940,7 +945,7 @@ document.getElementById('retry').addEventListener('click', function () {
 async function createTab(ws, existingPage = null, existingClient = null) {
     if (ws.tabs.size >= MAX_TABS_PER_SESSION) {
         if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'error', error: `Tab limit reached (${MAX_TABS_PER_SESSION}). Close a tab first.` }));
+            ws.send(JSON.stringify({ type: 'error', error: `Tab limit reached (${MAX_TABS_PER_SESSION}). Close an existing tab first.` }));
         }
         if (existingPage && !existingPage.isClosed()) {
             await existingPage.close().catch(() => {});
@@ -958,7 +963,6 @@ async function createTab(ws, existingPage = null, existingClient = null) {
         } catch (_) {}
     }, targetUA).catch(() => {});
 
-    // SSRF In-page route protection: prevent scripts from accessing private addresses
     if (!ALLOW_PRIVATE_NAV) {
         await page.route('**/*', (route) => {
             try {
@@ -977,7 +981,31 @@ async function createTab(ws, existingPage = null, existingClient = null) {
         await adblocker.enableBlockingInPage(page).catch(() => {});
     }
 
-    // Handle Page Dialogs (alerts, confirms, prompts) so the browser engine never hangs
+    // Remote Console & Error Monitoring
+    page.on('console', (cMsg) => {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'console_event',
+                tabId,
+                level: cMsg.type(),
+                text: cMsg.text(),
+                location: cMsg.location()
+            }));
+        }
+    });
+
+    page.on('pageerror', (pErr) => {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'console_event',
+                tabId,
+                level: 'error',
+                text: pErr.message
+            }));
+        }
+    });
+
+    // Handle Page Dialogs (alerts, confirms, prompts)
     page.on('dialog', async (dialog) => {
         page._pendingDialog = dialog;
         if (ws.readyState === WebSocket.OPEN) {
@@ -1038,7 +1066,10 @@ async function createTab(ws, existingPage = null, existingClient = null) {
     page.on('filechooser', async (fileChooser) => {
         ws.activeFileChooser = fileChooser;
         if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'file_chooser_open' }));
+            ws.send(JSON.stringify({
+                type: 'file_chooser_open',
+                isMultiple: fileChooser.isMultiple()
+            }));
         }
     });
 
@@ -1058,6 +1089,21 @@ async function createTab(ws, existingPage = null, existingClient = null) {
         } catch (_) {}
     });
 
+    page.on('response', (res) => {
+        try {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'network_event',
+                    tabId,
+                    status: res.status(),
+                    url: res.url(),
+                    method: res.request().method(),
+                    resourceType: res.request().resourceType()
+                }));
+            }
+        } catch (_) {}
+    });
+
     page.on('requestfailed', (req) => {
         try {
             if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
@@ -1068,7 +1114,6 @@ async function createTab(ws, existingPage = null, existingClient = null) {
         } catch (_) {}
     });
 
-    // Handle Page Close event (e.g. window.close() invoked by target site)
     page.on('close', () => {
         if (ws.tabs.has(tabId)) {
             closeTab(ws, tabId).catch(() => {});
@@ -1091,6 +1136,7 @@ async function createTab(ws, existingPage = null, existingClient = null) {
         title: currentUrl.includes('google') ? 'Google' : 'New Tab',
         url: currentUrl,
         favicon: '',
+        isPlayingAudio: false,
         searchId: null,
         searchCount: 0,
         searchIndex: 0
@@ -1221,10 +1267,11 @@ async function initBrowserContext(ws) {
     const ua = ws.currentUserAgent || DEFAULT_UA;
     const isMobile = ws.isMobileUa === true;
 
-    ws.viewportWidth = isMobile ? 390 : 1920;
-    ws.viewportHeight = isMobile ? 844 : 1080;
+    if (!ws.viewportWidth || !ws.viewportHeight) {
+        ws.viewportWidth = isMobile ? 390 : 1920;
+        ws.viewportHeight = isMobile ? 844 : 1080;
+    }
 
-    // Send viewport resolution to client so coordinate mapping is exact
     if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
             type: 'viewport_dimensions',
@@ -1266,10 +1313,9 @@ async function initBrowserContext(ws) {
         await attachContextBindings(ws.context);
     }
 
-    // Critical: Listen for new pages / popups (target="_blank" or window.open)
     ws.context.on('page', async (newPage) => {
         try {
-            console.log('[popup] Detected new window/popup');
+            console.log('[popup] Handling new window/popup');
             const newTabId = await createTab(ws, newPage);
             if (newTabId) {
                 await switchTab(ws, newTabId);
@@ -1294,6 +1340,23 @@ async function recreateSessionBrowser(ws, navigateTo) {
         await page.goto(safe).catch((e) => renderErrorPage(page, safe, e.message));
     } catch (e) {
         await renderErrorPage(page, target, e.message);
+    }
+}
+
+function buildSearchUrl(query, engine) {
+    const q = encodeURIComponent(query);
+    switch (engine) {
+        case 'duckduckgo':
+            return `https://duckduckgo.com/?q=${q}`;
+        case 'brave':
+            return `https://search.brave.com/search?q=${q}`;
+        case 'bing':
+            return `https://www.bing.com/search?q=${q}`;
+        case 'ecosia':
+            return `https://www.ecosia.org/search?q=${q}`;
+        case 'google':
+        default:
+            return `https://www.google.com/search?q=${q}`;
     }
 }
 
@@ -1326,6 +1389,7 @@ wss.on('connection', async (ws) => {
     ws.zoomFactor = 1;
     ws.viewportWidth = 1920;
     ws.viewportHeight = 1080;
+    ws.searchEngine = 'google';
 
     let waited = 0;
     while (browserStarting && waited < 60_000) {
@@ -1398,13 +1462,19 @@ wss.on('connection', async (ws) => {
             } else if (msg.type === 'goto' || msg.type === 'new_tab') {
                 if (msg.url && (typeof msg.url !== 'string' || msg.url.length > 2048)) return;
             } else if (msg.type === 'type') {
-                if (typeof msg.text !== 'string' || msg.text.length > 25000) return;
-            } else if (msg.type === 'switch_tab' || msg.type === 'close_tab') {
+                if (typeof msg.text !== 'string' || msg.text.length > 30000) return;
+            } else if (msg.type === 'switch_tab' || msg.type === 'close_tab' || msg.type === 'duplicate_tab' || msg.type === 'close_other_tabs' || msg.type === 'reload_tab') {
                 if (typeof msg.tabId !== 'string' || !/^tab_\d+$/.test(msg.tabId)) return;
+            } else if (msg.type === 'set_viewport') {
+                if (typeof msg.width !== 'number' || typeof msg.height !== 'number') return;
+                msg.width = Math.max(320, Math.min(3840, Math.round(msg.width)));
+                msg.height = Math.max(240, Math.min(2160, Math.round(msg.height)));
             } else if (msg.type === 'toggle_adblocker' || msg.type === 'toggle_vpn') {
                 if (typeof msg.enabled !== 'boolean') return;
             } else if (msg.type === 'set_mute') {
                 if (typeof msg.muted !== 'boolean') return;
+            } else if (msg.type === 'mute_tab') {
+                if (typeof msg.tabId !== 'string' || typeof msg.muted !== 'boolean') return;
             } else if (msg.type === 'set_useragent') {
                 if (typeof msg.userAgent !== 'string' || msg.userAgent.length > 512) return;
             } else if (msg.type === 'set_stream_quality') {
@@ -1415,10 +1485,12 @@ wss.on('connection', async (ws) => {
             } else if (msg.type === 'file_uploaded') {
                 if (typeof msg.name !== 'string' || msg.name.length > 255) return;
                 if (typeof msg.data !== 'string') return;
-                const approxBytes = Math.ceil(msg.data.length * 0.75);
-                if (approxBytes > MAX_UPLOAD_BYTES) return;
+            } else if (msg.type === 'files_uploaded') {
+                if (!Array.isArray(msg.files) || msg.files.length > 20) return;
             } else if (msg.type === 'set_proxy') {
                 if (typeof msg.proxy !== 'string' || msg.proxy.length > 512) return;
+            } else if (msg.type === 'set_search_engine') {
+                if (typeof msg.engine !== 'string' || !['google', 'duckduckgo', 'brave', 'bing', 'ecosia'].includes(msg.engine)) return;
             } else if (msg.type === 'find') {
                 if (typeof msg.query !== 'string' || msg.query.length > 512) return;
             } else if (msg.type === 'find_next') {
@@ -1430,7 +1502,6 @@ wss.on('connection', async (ws) => {
             return;
         }
 
-        // Refresh session activity timestamp
         if (ws.tokenHash) {
             const meta = validTokens.get(ws.tokenHash);
             if (!isTokenValid(meta)) {
@@ -1455,6 +1526,26 @@ wss.on('connection', async (ws) => {
                 return;
             }
 
+            if (msg.type === 'set_viewport') {
+                ws.viewportWidth = msg.width;
+                ws.viewportHeight = msg.height;
+                if (ws.context) {
+                    for (const tab of ws.tabs.values()) {
+                        if (!tab.page.isClosed()) {
+                            await tab.page.setViewportSize({ width: msg.width, height: msg.height }).catch(() => {});
+                        }
+                    }
+                }
+                if (ws.activeTabId && ws.tabs.has(ws.activeTabId)) {
+                    const t = ws.tabs.get(ws.activeTabId);
+                    await stopScreencast(t.client);
+                    await startScreencast(t.client, ws);
+                    t.page.screenshot({ type: 'jpeg', quality: Math.min(ws.streamQuality || 80, 85) })
+                        .then((buf) => sendFrameToClient(ws, buf)).catch(() => {});
+                }
+                return;
+            }
+
             if (msg.type === 'new_tab') {
                 const id = await createTab(ws);
                 if (!id) return;
@@ -1471,13 +1562,145 @@ wss.on('connection', async (ws) => {
                 return;
             }
 
+            if (msg.type === 'duplicate_tab') {
+                if (!ws.tabs.has(msg.tabId)) return;
+                const srcTab = ws.tabs.get(msg.tabId);
+                const newId = await createTab(ws);
+                if (!newId) return;
+                await switchTab(ws, newId);
+                const p = ws.tabs.get(newId).page;
+                const target = srcTab.url || 'https://www.google.com';
+                try {
+                    const safe = assertSafeNavigationUrl(target);
+                    p.goto(safe).catch((e) => renderErrorPage(p, safe, e.message));
+                } catch (e) {
+                    renderErrorPage(p, target, e.message);
+                }
+                return;
+            }
+
+            if (msg.type === 'close_other_tabs') {
+                for (const id of Array.from(ws.tabs.keys())) {
+                    if (id !== msg.tabId) {
+                        await closeTab(ws, id);
+                    }
+                }
+                return;
+            }
+
+            if (msg.type === 'reload_tab') {
+                if (ws.tabs.has(msg.tabId)) {
+                    ws.tabs.get(msg.tabId).page.reload().catch(() => {});
+                }
+                return;
+            }
+
+            if (msg.type === 'mute_tab') {
+                if (ws.tabs.has(msg.tabId)) {
+                    const p = ws.tabs.get(msg.tabId).page;
+                    await p.evaluate((muted) => {
+                        document.querySelectorAll('video, audio').forEach((el) => { el.muted = muted; });
+                    }, !!msg.muted).catch(() => {});
+                }
+                return;
+            }
+
             if (msg.type === 'switch_tab') { await switchTab(ws, msg.tabId); return; }
             if (msg.type === 'close_tab') { await closeTab(ws, msg.tabId); return; }
+
+            if (msg.type === 'set_search_engine') {
+                ws.searchEngine = msg.engine;
+                return;
+            }
 
             if (msg.type === 'clear_session') {
                 if (ws.context) {
                     await ws.context.clearCookies().catch(() => {});
                     for (const tab of ws.tabs.values()) tab.page.reload().catch(() => {});
+                }
+                return;
+            }
+
+            if (msg.type === 'get_cookies') {
+                if (ws.context) {
+                    const cookies = await ws.context.cookies().catch(() => []);
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'cookies_list', cookies }));
+                    }
+                }
+                return;
+            }
+
+            if (msg.type === 'clear_cookies') {
+                if (ws.context) {
+                    if (msg.domain) {
+                        const all = await ws.context.cookies().catch(() => []);
+                        const filtered = all.filter(c => c.domain.includes(msg.domain));
+                        // Playwright clearCookies takes name/domain filters
+                        for (const c of filtered) {
+                            await ws.context.clearCookies({ name: c.name, domain: c.domain }).catch(() => {});
+                        }
+                    } else {
+                        await ws.context.clearCookies().catch(() => {});
+                    }
+                    if (ws.activeTabId && ws.tabs.has(ws.activeTabId)) {
+                        ws.tabs.get(ws.activeTabId).page.reload().catch(() => {});
+                    }
+                }
+                return;
+            }
+
+            if (msg.type === 'capture_screenshot') {
+                if (ws.activeTabId && ws.tabs.has(ws.activeTabId)) {
+                    const p = ws.tabs.get(ws.activeTabId).page;
+                    try {
+                        const buf = await p.screenshot({ fullPage: !!msg.fullPage, type: 'png' });
+                        const fileId = crypto.randomBytes(6).toString('hex');
+                        const filename = `screenshot_${Date.now()}.png`;
+                        const storedName = `${fileId}_${filename}`;
+                        const resolved = path.resolve(downloadsDir, storedName);
+                        await fs.promises.writeFile(resolved, buf);
+
+                        if (ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({
+                                type: 'download_ready',
+                                filename,
+                                url: `/downloads/${encodeURIComponent(storedName)}`
+                            }));
+                            ws.send(JSON.stringify({
+                                type: 'screenshot_taken',
+                                filename,
+                                data: buf.toString('base64')
+                            }));
+                        }
+                    } catch (e) {
+                        console.warn('[screenshot] Error:', e.message);
+                    }
+                }
+                return;
+            }
+
+            if (msg.type === 'export_pdf') {
+                if (ws.activeTabId && ws.tabs.has(ws.activeTabId)) {
+                    const p = ws.tabs.get(ws.activeTabId).page;
+                    try {
+                        const buf = await p.pdf({ format: 'A4', printBackground: true });
+                        const fileId = crypto.randomBytes(6).toString('hex');
+                        const filename = `document_${Date.now()}.pdf`;
+                        const storedName = `${fileId}_${filename}`;
+                        const resolved = path.resolve(downloadsDir, storedName);
+                        await fs.promises.writeFile(resolved, buf);
+
+                        if (ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({
+                                type: 'download_ready',
+                                filename,
+                                url: `/downloads/${encodeURIComponent(storedName)}`
+                            }));
+                        }
+                    } catch (e) {
+                        console.warn('[pdf] Error:', e.message);
+                    }
                 }
                 return;
             }
@@ -1499,6 +1722,8 @@ wss.on('connection', async (ws) => {
                 const targetUA = profiles[key] || key;
                 ws.currentUserAgent = targetUA;
                 ws.isMobileUa = key === 'mobile' || /iPhone|Android|Mobile/i.test(targetUA);
+                ws.viewportWidth = ws.isMobileUa ? 390 : 1920;
+                ws.viewportHeight = ws.isMobileUa ? 844 : 1080;
                 const currentUrl = (ws.activeTabId && ws.tabs.get(ws.activeTabId)?.url) || 'https://www.google.com';
                 await recreateSessionBrowser(ws, currentUrl);
                 return;
@@ -1552,6 +1777,33 @@ wss.on('connection', async (ws) => {
                     ws.activeFileChooser = null;
                 } catch (err) {
                     console.error('[upload] Failed:', err.message);
+                }
+                return;
+            }
+
+            if (msg.type === 'files_uploaded') {
+                if (!ws.activeFileChooser || !Array.isArray(msg.files)) return;
+                try {
+                    const filePaths = [];
+                    for (const f of msg.files) {
+                        const safeName = sanitizeDownloadName(f.name);
+                        const buffer = Buffer.from(f.data, 'base64');
+                        if (buffer.length > MAX_UPLOAD_BYTES) continue;
+                        const tempPath = path.join(downloadsDir, `upload_${Date.now()}_${safeName}`);
+                        const resolved = path.resolve(tempPath);
+                        if (!resolved.startsWith(path.resolve(downloadsDir) + path.sep)) continue;
+                        await fs.promises.writeFile(resolved, buffer);
+                        filePaths.push(resolved);
+                    }
+                    if (filePaths.length > 0) {
+                        await ws.activeFileChooser.setFiles(filePaths);
+                        setTimeout(() => {
+                            filePaths.forEach(p => fs.promises.unlink(p).catch(() => {}));
+                        }, 5000);
+                    }
+                    ws.activeFileChooser = null;
+                } catch (err) {
+                    console.error('[upload-multi] Failed:', err.message);
                 }
                 return;
             }
@@ -1636,8 +1888,8 @@ wss.on('connection', async (ws) => {
                                 await tab.client.send('DOM.highlightNode', {
                                     nodeId: matches.nodeIds[0],
                                     highlightConfig: {
-                                        borderColor: { r: 255, g: 100, b: 0, a: 1 },
-                                        contentColor: { r: 255, g: 200, b: 0, a: 0.25 }
+                                        borderColor: { r: 59, g: 130, b: 246, a: 1 },
+                                        contentColor: { r: 59, g: 130, b: 246, a: 0.3 }
                                     }
                                 }).catch(() => {});
                             }
@@ -1673,8 +1925,8 @@ wss.on('connection', async (ws) => {
                         await tab.client.send('DOM.highlightNode', {
                             nodeId: matches.nodeIds[0],
                             highlightConfig: {
-                                borderColor: { r: 255, g: 100, b: 0, a: 1 },
-                                contentColor: { r: 255, g: 200, b: 0, a: 0.25 }
+                                borderColor: { r: 59, g: 130, b: 246, a: 1 },
+                                contentColor: { r: 59, g: 130, b: 246, a: 0.3 }
                             }
                         }).catch(() => {});
                     }
@@ -1730,7 +1982,7 @@ wss.on('connection', async (ws) => {
                             target = 'https://' + target;
                             isAutoprepended = true;
                         } else {
-                            target = 'https://www.google.com/search?q=' + encodeURIComponent(target);
+                            target = buildSearchUrl(target, msg.searchEngine || ws.searchEngine);
                         }
                     }
 
@@ -1760,7 +2012,6 @@ wss.on('connection', async (ws) => {
                     break;
                 }
                 case 'type':
-                    // CRITICAL FIX: insertText eliminates key event starvation and form Enter submission bugs
                     p.keyboard.insertText(msg.text).catch(() => {});
                     break;
                 case 'back':

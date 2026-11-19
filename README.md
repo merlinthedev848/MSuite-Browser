@@ -6,17 +6,43 @@ A secure, high-performance Remote Browser Isolation (RBI) tool built with Node.j
 
 ---
 
-## Architecture & Features
+## Architecture & Features (v2.0 Enterprise)
 
-- **Endpoint Isolation:** Target website code executes inside an isolated container on the remote Debian server. Only encrypted frame streams and user input are exchanged.
+- **Hardware-Accelerated Canvas Engine:** Replaces laggy DOM image swapping with a high-throughput, desynchronized HTML5 `<canvas>` rendering pipeline driven by off-thread `createImageBitmap()` decoding. Delivers ultra-low latency, 60 FPS streaming, and zero garbage-collection stutter.
+- **Remote DevTools Suite:** Inspect remote web applications live! Full remote console stream (`console.log`, `info`, `warn`, `error`) and real-time network monitor capturing HTTP methods, status codes, request URLs, and response MIME types over WebSockets.
+- **Real-Time Performance HUD:** On-screen telemetry gauge displaying real-time FPS, round-trip frame latency in milliseconds, active viewport resolution, and dropped frames counter.
+- **Dynamic Device Emulation:** Switch viewports instantly without restarting sessions:
+  - Desktop 1080p (`1920x1080`)
+  - Laptop (`1366x768`)
+  - iPad Pro (`1024x1366`)
+  - iPhone 15 Pro (`393x852`)
+  - Samsung Galaxy S24 (`412x915`)
+  - Dynamic Auto-Fit (Matches local browser window)
+- **Native Document Export & Full-Page Capture:** Capture crisp viewport screenshots, full-page stitched screenshots, or generate high-fidelity vector PDF documents via native Chromium rendering.
+- **Omnibox 2.0 & Multi-Engine Search:** Switch your active search engine directly inside the omnibox (Google, DuckDuckGo, Brave, Bing, Ecosia) with automatic search query expansion and clickable SSL/Isolation status inspector.
+- **Session Cookies Inspector & Wipe:** View all cookies stored in the isolated session, complete with domain, security flags (Secure, HttpOnly, SameSite), and one-click cookie deletion.
+- **Power Tab Management:** Full tab context menu with duplicate tab, reload tab, close other tabs, and real-time audio playback detection with live mute/unmute toggles.
 - **Cross-Site WebSocket Hijacking (CSWSH) Defense:** Strict origin and host validation on WebSocket upgrade and API authentication.
 - **SSRF & Private Network Mitigation:** Enforces strict boundary checks blocking internal addresses, loopbacks, link-local addresses, and cloud provider metadata endpoints (`ALLOW_PRIVATE_NAV=0`).
-- **Dynamic Viewport & Touchscreen Support:** Real-time coordinate mapping for desktop (1920x1080) and mobile (390x844) viewport profiles, with native touch/swipe support on phones and tablets.
-- **Popup & New Window Handling:** Seamlessly intercepts and manages `target="_blank"` popups and `window.open()` calls into tabbed sessions.
 - **Interactive JavaScript Dialogs:** Captures and presents remote `alert()`, `confirm()`, and `prompt()` modals without freezing browser execution.
 - **Ad & Tracker Defense:** Built-in ad and tracker blocking powered by `@ghostery/adblocker-playwright`.
 - **Integrated SOCKS5 / WARP Routing:** Optional userspace Cloudflare WARP client or custom SOCKS5/HTTP proxy support.
-- **Synchronized Clipboard & File Handling:** Instantaneous text insertion (`insertText`) and sanitized file uploads and downloads.
+- **Anti-Automation Detection:** Strips automation flags (`--disable-blink-features=AutomationControlled`, removes `navigator.webdriver`) to bypass anti-bot and Cloudflare checks.
+- **Synchronized Clipboard & File Handling:** Instantaneous text insertion (`insertText`) and sanitized multi-file uploads and downloads.
+
+---
+
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl + T` | Open new tab |
+| `Ctrl + W` | Close current tab |
+| `Ctrl + R` | Reload current tab |
+| `Ctrl + L` | Focus Omnibox URL bar |
+| `Ctrl + Shift + I` | Toggle Remote DevTools Drawer (Console/Network) |
+| `Ctrl + Shift + H` | Toggle Browsing History Drawer |
+| `Escape` | Dismiss any open modal, drawer, or dropdown menu |
 
 ---
 
