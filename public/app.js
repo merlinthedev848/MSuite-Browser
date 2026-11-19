@@ -1991,20 +1991,5 @@ function escapeHtml(value) {
         .replace(/'/g, '&#39;');
 }
 
-// ---------- Bootstrap Stored Session ----------
-(async () => {
-    try {
-        const res = await fetch('/api/session', { credentials: 'same-origin' });
-        if (!res.ok) {
-            sessionStorage.removeItem('vb_token');
-            return;
-        }
-        sessionStorage.setItem('vb_token', '1');
-        loginScreen.classList.add('hidden');
-        appContainer.classList.remove('hidden');
-        initApp();
-        setTimeout(() => syncViewportToContainer(true), 120);
-    } catch (_) {
-        sessionStorage.removeItem('vb_token');
-    }
-})();
+// ---------- Initial State: Always Stop at Password Entry ----------
+passwordInput.focus();
