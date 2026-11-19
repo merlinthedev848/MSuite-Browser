@@ -165,6 +165,27 @@ test('Protected Endpoints: Reject unauthenticated requests', async () => {
 
     const resDown = await fetch(`${baseUrl}/downloads/nonexistent.pdf`);
     assert.equal(resDown.status, 401);
+
+    const resApiDown = await fetch(`${baseUrl}/api/downloads`);
+    assert.equal(resApiDown.status, 401);
+});
+
+test('Download API: GET /api/downloads returns file list when authenticated', async () => {
+    const testToken = 'dl_test_token_789';
+    validTokens.set(hashToken(testToken), {
+        createdAt: Date.now(),
+        lastActivity: Date.now(),
+        ip: '127.0.0.1'
+    });
+
+    const res = await fetch(`${baseUrl}/api/downloads`, {
+        headers: {
+            'Cookie': `vb_session=${testToken}`
+        }
+    });
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    assert.equal(Array.isArray(json.files), true);
 });
 
 test('WebSocket Upgrade: Rejects unauthenticated connections and CSWSH attacks', async () => {

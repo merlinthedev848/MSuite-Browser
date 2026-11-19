@@ -389,6 +389,22 @@
                 <p class="settings-section-label">Privacy &amp; Security</p>
                 <div class="settings-group">
                     <label class="toggle-control">
+                        <span>🏠 Allow Private &amp; Internal LAN IPs (10.x, 192.168.x, 172.x)</span>
+                        <input type="checkbox" id="private-nav-toggle" checked />
+                        <span class="control-indicator"></span>
+                    </label>
+                    <p class="settings-hint">Enables VPN-style browsing to access internal web servers and homelab devices.</p>
+                </div>
+                <div class="settings-group">
+                    <label class="toggle-control">
+                        <span>⬇️ Auto-Download Remote Files to Local Machine</span>
+                        <input type="checkbox" id="auto-download-toggle" checked />
+                        <span class="control-indicator"></span>
+                    </label>
+                    <p class="settings-hint">Instantly triggers native downloads on your local device whenever remote browser downloads complete.</p>
+                </div>
+                <div class="settings-group">
+                    <label class="toggle-control">
                         <span>🛡️ Ad &amp; Tracker Blocker</span>
                         <input type="checkbox" id="adblock-toggle" checked />
                         <span class="control-indicator"></span>
@@ -468,11 +484,14 @@
         <!-- Downloads Drawer -->
         <div id="downloads-panel" class="downloads-panel hidden" role="dialog" aria-modal="false" aria-label="Downloads drawer">
             <div class="downloads-header">
-                <span>📥 Downloads &amp; Captures</span>
-                <button id="downloads-close-btn" class="modal-close-btn" aria-label="Close downloads">✕</button>
+                <span>📥 Remote Desktop Downloads</span>
+                <div style="display:flex; gap: 8px; align-items: center;">
+                    <button id="downloads-refresh-btn" class="btn-micro" title="Refresh download list">🔄</button>
+                    <button id="downloads-close-btn" class="modal-close-btn" aria-label="Close downloads">✕</button>
+                </div>
             </div>
             <div id="downloads-list" class="downloads-list">
-                <p class="downloads-empty">No downloads in this session.</p>
+                <p class="downloads-empty">No downloads yet. Download any file in the browser to save it to your computer.</p>
             </div>
         </div>
 

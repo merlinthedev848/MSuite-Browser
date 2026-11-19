@@ -89,6 +89,8 @@ const clipPushBtn        = document.getElementById('clip-push-btn');
 const settingsBtn        = document.getElementById('settings-btn');
 const settingsModal      = document.getElementById('settings-modal');
 const settingsCloseBtn   = document.getElementById('settings-close-btn');
+const privateNavToggle    = document.getElementById('private-nav-toggle');
+const autoDownloadToggle  = document.getElementById('auto-download-toggle');
 const adblockToggle      = document.getElementById('adblock-toggle');
 const vpnToggle          = document.getElementById('vpn-toggle');
 const uaSelect           = document.getElementById('ua-select');
@@ -121,6 +123,7 @@ const muteIconOff        = document.getElementById('mute-icon-off');
 // Downloads panel
 const downloadsPanel     = document.getElementById('downloads-panel');
 const downloadsCloseBtn  = document.getElementById('downloads-close-btn');
+const downloadsRefreshBtn= document.getElementById('downloads-refresh-btn');
 const downloadsList      = document.getElementById('downloads-list');
 
 // Upload panel
@@ -197,6 +200,8 @@ let isMuted = false;
 let isDarkInverted = false;
 let selectedSearchEngine = localStorage.getItem('vb_search_engine') || 'google';
 let selectedDeviceMode = localStorage.getItem('vb_device_mode') || 'match';
+let allowPrivateNav = localStorage.getItem('vb_allow_private_nav') !== '0';
+let autoDownload = localStorage.getItem('vb_auto_download') !== '0';
 
 // Viewport & Resolution
 let remoteWidth = 1920;
@@ -362,6 +367,7 @@ function connectWS() {
         hideOverlay();
         viewportContainer.classList.add('ready');
         sendMsg({ type: 'set_search_engine', engine: selectedSearchEngine });
+        sendMsg({ type: 'toggle_private_nav', enabled: allowPrivateNav });
         syncViewportToContainer(true);
     };
 
@@ -513,6 +519,10 @@ function connectWS() {
             case 'download_ready':
                 addDownloadItem(msg.filename, msg.url);
                 downloadsPanel.classList.remove('hidden');
+                if (autoDownload) {
+                    triggerDirectDownload(msg.url, msg.filename);
+                    showDownloadToast(msg.filename, msg.url);
+                }
                 break;
 
             case 'file_chooser_open':
@@ -1388,6 +1398,34 @@ function showScreenshotToast(filename, base64Data) {
     setTimeout(() => toast.remove(), 6000);
 }
 
+// ---------- Local Direct Download Handling ----------
+function triggerDirectDownload(url, filename) {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || 'download';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => a.remove(), 1000);
+}
+
+function showDownloadToast(filename, url) {
+    const toast = document.createElement('div');
+    toast.className = 'screenshot-toast';
+    toast.innerHTML = `
+        <span style="font-size: 20px; line-height: 1; margin-right: 8px;">📥</span>
+        <div class="toast-body">
+            <strong>Downloaded to Local Device</strong>
+            <span>${escapeHtml(filename)}</span>
+        </div>
+        <a href="${url}" download="${escapeHtml(filename)}" class="btn-micro" style="text-decoration:none; padding: 4px 8px; margin-left: 6px;">Re-Save</a>
+        <button class="btn-micro" id="toast-close">✕</button>
+    `;
+    document.body.appendChild(toast);
+    toast.querySelector('#toast-close').addEventListener('click', () => toast.remove());
+    setTimeout(() => toast.remove(), 7000);
+}
+
 // ---------- Clipboard Manager ----------
 clipBtn.addEventListener('click', () => {
     clipModal.classList.toggle('hidden');
@@ -1418,6 +1456,23 @@ settingsBtn.addEventListener('click', () => {
 });
 
 settingsCloseBtn.addEventListener('click', () => settingsModal.classList.add('hidden'));
+
+if (privateNavToggle) {
+    privateNavToggle.checked = allowPrivateNav;
+    privateNavToggle.addEventListener('change', () => {
+        allowPrivateNav = privateNavToggle.checked;
+        localStorage.setItem('vb_allow_private_nav', allowPrivateNav ? '1' : '0');
+        sendMsg({ type: 'toggle_private_nav', enabled: allowPrivateNav });
+    });
+}
+
+if (autoDownloadToggle) {
+    autoDownloadToggle.checked = autoDownload;
+    autoDownloadToggle.addEventListener('change', () => {
+        autoDownload = autoDownloadToggle.checked;
+        localStorage.setItem('vb_auto_download', autoDownload ? '1' : '0');
+    });
+}
 
 adblockToggle.addEventListener('change', () => {
     sendMsg({ type: 'toggle_adblocker', enabled: adblockToggle.checked });
@@ -1548,10 +1603,66 @@ downloadsBtn.addEventListener('click', () => {
     downloadsPanel.classList.toggle('hidden');
     if (!downloadsPanel.classList.contains('hidden')) {
         closeAllModals([downloadsPanel]);
+        fetchRemoteDownloads();
     }
 });
 
 downloadsCloseBtn.addEventListener('click', () => downloadsPanel.classList.add('hidden'));
+
+if (downloadsRefreshBtn) {
+    downloadsRefreshBtn.addEventListener('click', fetchRemoteDownloads);
+}
+
+async function fetchRemoteDownloads() {
+    try {
+        const res = await fetch('/api/downloads', { credentials: 'same-origin' });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.files && Array.isArray(data.files)) {
+            downloadsList.innerHTML = '';
+            if (data.files.length === 0) {
+                downloadsList.innerHTML = '<p class="downloads-empty">No downloads yet. Download any file in the browser to save it to your computer.</p>';
+                return;
+            }
+            data.files.forEach(f => {
+                const item = document.createElement('div');
+                item.className = 'download-item';
+
+                const nameEl = document.createElement('span');
+                nameEl.className = 'download-item-name';
+                nameEl.title = f.filename;
+                const sizeKb = Math.round(f.size / 1024);
+                const sizeLabel = sizeKb > 1024 ? `${(sizeKb / 1024).toFixed(1)} MB` : `${sizeKb} KB`;
+                nameEl.textContent = `${f.filename} (${sizeLabel})`;
+
+                const actions = document.createElement('div');
+                actions.style.display = 'flex';
+                actions.style.gap = '6px';
+
+                const linkEl = document.createElement('a');
+                linkEl.className = 'download-item-link';
+                linkEl.href = f.url;
+                linkEl.download = f.filename;
+                linkEl.textContent = 'Save ↓';
+
+                const delBtn = document.createElement('button');
+                delBtn.className = 'btn-micro btn-danger';
+                delBtn.textContent = '✕';
+                delBtn.title = 'Delete from remote server';
+                delBtn.addEventListener('click', async () => {
+                    await fetch(`/api/downloads/${encodeURIComponent(f.storedName)}`, { method: 'DELETE', credentials: 'same-origin' });
+                    item.remove();
+                });
+
+                actions.appendChild(linkEl);
+                actions.appendChild(delBtn);
+                item.appendChild(nameEl);
+                item.appendChild(actions);
+                downloadsList.appendChild(item);
+            });
+        }
+    } catch (_) {}
+}
 
 function addDownloadItem(filename, url) {
     const empty = downloadsList.querySelector('.downloads-empty');

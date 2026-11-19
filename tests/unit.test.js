@@ -131,10 +131,16 @@ test('Navigation Guard: assertSafeNavigationUrl strictly enforces protocol and b
     assert.throws(() => assertSafeNavigationUrl('blob:http://example.com/uuid'), /Only http\/https navigation is allowed/);
     assert.throws(() => assertSafeNavigationUrl('not a url'), /Invalid URL/);
 
-    // Blocked Private/Internal Hosts
-    assert.throws(() => assertSafeNavigationUrl('http://127.0.0.1:8080/admin'), /blocked/);
-    assert.throws(() => assertSafeNavigationUrl('http://169.254.169.254/latest/meta-data/'), /blocked/);
-    assert.throws(() => assertSafeNavigationUrl('http://localhost:3000'), /blocked/);
+    // Blocked Private/Internal Hosts when allowPrivate is false
+    assert.throws(() => assertSafeNavigationUrl('http://127.0.0.1:8080/admin', false), /blocked/);
+    assert.throws(() => assertSafeNavigationUrl('http://169.254.169.254/latest/meta-data/', false), /blocked/);
+    assert.throws(() => assertSafeNavigationUrl('http://localhost:3000', false), /blocked/);
+});
+
+test('VPN / Intranet Access: assertSafeNavigationUrl permits internal LAN IPs when enabled', () => {
+    assert.equal(assertSafeNavigationUrl('http://10.0.0.185:8080/', true), 'http://10.0.0.185:8080/');
+    assert.equal(assertSafeNavigationUrl('http://192.168.1.1:8443/login', true), 'http://192.168.1.1:8443/login');
+    assert.equal(assertSafeNavigationUrl('http://172.16.1.10/', true), 'http://172.16.1.10/');
 });
 
 test('Omnibox Query Routing: buildSearchUrl supports all designated engines', () => {

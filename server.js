@@ -11,7 +11,7 @@ const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const NODE_ENV = process.env.NODE_ENV || 'production';
 const PASSWORD = process.env.PASSWORD || (NODE_ENV === 'test' ? 'test_secure_password_1234' : '');
-const ALLOW_PRIVATE_NAV = process.env.ALLOW_PRIVATE_NAV === '1';
+const ALLOW_PRIVATE_NAV = process.env.ALLOW_PRIVATE_NAV !== '0';
 const MAX_TABS_PER_SESSION = parseInt(process.env.MAX_TABS || '12', 10);
 const MAX_WS_SESSIONS = parseInt(process.env.MAX_WS_SESSIONS || '8', 10);
 const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_BYTES || String(16 * 1024 * 1024), 10); // 16 MB
@@ -151,7 +151,7 @@ function isPrivateOrBlockedHost(hostname) {
     return false;
 }
 
-function assertSafeNavigationUrl(rawUrl) {
+function assertSafeNavigationUrl(rawUrl, allowPrivate = ALLOW_PRIVATE_NAV) {
     let parsed;
     try {
         parsed = new URL(rawUrl);
@@ -161,7 +161,7 @@ function assertSafeNavigationUrl(rawUrl) {
     if (!['http:', 'https:'].includes(parsed.protocol)) {
         throw new Error('Only http/https navigation is allowed');
     }
-    if (!ALLOW_PRIVATE_NAV && isPrivateOrBlockedHost(parsed.hostname)) {
+    if (!allowPrivate && isPrivateOrBlockedHost(parsed.hostname)) {
         throw new Error('Navigation to private/internal addresses is blocked');
     }
     return parsed.toString();
@@ -481,6 +481,47 @@ app.use('/downloads', requireSession, express.static(downloadsDir, {
         res.setHeader('Cache-Control', 'private, no-store');
     }
 }));
+
+// Download Management API (List & Delete)
+app.get('/api/downloads', requireSession, (req, res) => {
+    fs.readdir(downloadsDir, async (err, files) => {
+        if (err || !files) return res.json({ files: [] });
+        const list = [];
+        for (const file of files) {
+            try {
+                const filePath = path.join(downloadsDir, file);
+                const stats = await fs.promises.stat(filePath);
+                if (stats.isFile()) {
+                    const parts = file.split('_');
+                    const originalName = parts.length > 1 ? parts.slice(1).join('_') : file;
+                    list.push({
+                        storedName: file,
+                        filename: originalName,
+                        size: stats.size,
+                        createdAt: stats.birthtimeMs || stats.mtimeMs,
+                        url: `/downloads/${encodeURIComponent(file)}`
+                    });
+                }
+            } catch (_) {}
+        }
+        list.sort((a, b) => b.createdAt - a.createdAt);
+        res.json({ files: list });
+    });
+});
+
+app.delete('/api/downloads/:name', requireSession, async (req, res) => {
+    try {
+        const file = path.basename(req.params.name);
+        const filePath = path.resolve(downloadsDir, file);
+        if (!filePath.startsWith(path.resolve(downloadsDir) + path.sep)) {
+            return res.status(400).json({ success: false, error: 'Invalid file path' });
+        }
+        await fs.promises.unlink(filePath);
+        res.json({ success: true });
+    } catch {
+        res.status(500).json({ success: false, error: 'Failed to delete file' });
+    }
+});
 
 // ---------- API Routes ----------
 app.get('/healthz', (_req, res) => {
@@ -974,7 +1015,7 @@ async function createTab(ws, existingPage = null, existingClient = null) {
         } catch (_) {}
     }, targetUA).catch(() => {});
 
-    if (!ALLOW_PRIVATE_NAV) {
+    if (ws.allowPrivateNav === false) {
         await page.route('**/*', (route) => {
             try {
                 const reqUrl = new URL(route.request().url());
@@ -1347,7 +1388,7 @@ async function recreateSessionBrowser(ws, navigateTo) {
     await switchTab(ws, tabId);
     const page = ws.tabs.get(tabId).page;
     try {
-        const safe = assertSafeNavigationUrl(target);
+        const safe = assertSafeNavigationUrl(target, ws.allowPrivateNav);
         await page.goto(safe).catch((e) => renderErrorPage(page, safe, e.message));
     } catch (e) {
         await renderErrorPage(page, target, e.message);
@@ -1401,6 +1442,7 @@ wss.on('connection', async (ws) => {
     ws.viewportWidth = 1920;
     ws.viewportHeight = 1080;
     ws.searchEngine = 'google';
+    ws.allowPrivateNav = ALLOW_PRIVATE_NAV;
 
     let waited = 0;
     while (browserStarting && waited < 60_000) {
@@ -1480,7 +1522,7 @@ wss.on('connection', async (ws) => {
                 if (typeof msg.width !== 'number' || typeof msg.height !== 'number') return;
                 msg.width = Math.max(320, Math.min(3840, Math.round(msg.width)));
                 msg.height = Math.max(240, Math.min(2160, Math.round(msg.height)));
-            } else if (msg.type === 'toggle_adblocker' || msg.type === 'toggle_vpn') {
+            } else if (msg.type === 'toggle_adblocker' || msg.type === 'toggle_vpn' || msg.type === 'toggle_private_nav') {
                 if (typeof msg.enabled !== 'boolean') return;
             } else if (msg.type === 'set_mute') {
                 if (typeof msg.muted !== 'boolean') return;
@@ -1573,7 +1615,7 @@ wss.on('connection', async (ws) => {
                 let target = msg.url || 'https://www.google.com';
                 try {
                     if (!/^https?:\/\//i.test(target)) target = 'https://' + target;
-                    target = assertSafeNavigationUrl(target);
+                    target = assertSafeNavigationUrl(target, ws.allowPrivateNav);
                     p.goto(target).catch((e) => renderErrorPage(p, target, e.message));
                 } catch (e) {
                     renderErrorPage(p, msg.url || target, e.message);
@@ -1590,7 +1632,7 @@ wss.on('connection', async (ws) => {
                 const p = ws.tabs.get(newId).page;
                 const target = srcTab.url || 'https://www.google.com';
                 try {
-                    const safe = assertSafeNavigationUrl(target);
+                    const safe = assertSafeNavigationUrl(target, ws.allowPrivateNav);
                     p.goto(safe).catch((e) => renderErrorPage(p, safe, e.message));
                 } catch (e) {
                     renderErrorPage(p, target, e.message);
@@ -1732,6 +1774,11 @@ wss.on('connection', async (ws) => {
                         else await adblocker.disableBlockingInPage(tab.page).catch(() => {});
                     }
                 }
+                return;
+            }
+
+            if (msg.type === 'toggle_private_nav') {
+                ws.allowPrivateNav = !!msg.enabled;
                 return;
             }
 
@@ -2006,7 +2053,7 @@ wss.on('connection', async (ws) => {
                     }
 
                     try {
-                        target = assertSafeNavigationUrl(target);
+                        target = assertSafeNavigationUrl(target, ws.allowPrivateNav);
                     } catch (e) {
                         await renderErrorPage(p, msg.url, e.message);
                         break;
@@ -2017,7 +2064,7 @@ wss.on('connection', async (ws) => {
                         console.warn(`[nav] ${e.message}`);
                         if (isAutoprepended && target.startsWith('https://')) {
                             try {
-                                const fallbackUrl = assertSafeNavigationUrl(target.replace(/^https:/, 'http:'));
+                                const fallbackUrl = assertSafeNavigationUrl(target.replace(/^https:/, 'http:'), ws.allowPrivateNav);
                                 await activePage.goto(fallbackUrl).catch(async (err) => {
                                     await renderErrorPage(activePage, target, err.message);
                                 });

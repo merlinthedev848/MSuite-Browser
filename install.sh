@@ -109,6 +109,7 @@ sudo docker run -d \
     --name msuite-browser \
     -p 3000:3000 \
     -e PASSWORD="$USER_PASSWORD" \
+    -e ALLOW_PRIVATE_NAV=1 \
     -e TRUST_PROXY=0 \
     -v "$(pwd)/browser_data:/usr/src/app/browser_data" \
     --shm-size 2g \
