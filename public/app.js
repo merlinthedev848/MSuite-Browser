@@ -781,14 +781,26 @@ window.addEventListener('keydown', (e) => {
 
     const isCmdOrCtrl = e.ctrlKey || e.metaKey;
 
-    if (isCmdOrCtrl && e.key.toLowerCase() === 'l') {
+    if (isCmdOrCtrl && e.shiftKey && e.key.toLowerCase() === 'i') {
+        e.preventDefault();
+        devtoolsBtn.click();
+        return;
+    }
+
+    if (isCmdOrCtrl && e.shiftKey && e.key.toLowerCase() === 'h') {
+        e.preventDefault();
+        historyBtn.click();
+        return;
+    }
+
+    if (isCmdOrCtrl && !e.shiftKey && e.key.toLowerCase() === 'l') {
         e.preventDefault();
         urlInput.focus();
         urlInput.select();
         return;
     }
 
-    if (isCmdOrCtrl && e.key.toLowerCase() === 'h') {
+    if (isCmdOrCtrl && !e.shiftKey && e.key.toLowerCase() === 'h') {
         e.preventDefault();
         historyBtn.click();
         return;

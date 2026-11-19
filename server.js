@@ -9,8 +9,8 @@ const fs = require('fs');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const PASSWORD = process.env.PASSWORD || '';
 const NODE_ENV = process.env.NODE_ENV || 'production';
+const PASSWORD = process.env.PASSWORD || (NODE_ENV === 'test' ? 'test_secure_password_1234' : '');
 const ALLOW_PRIVATE_NAV = process.env.ALLOW_PRIVATE_NAV === '1';
 const MAX_TABS_PER_SESSION = parseInt(process.env.MAX_TABS || '12', 10);
 const MAX_WS_SESSIONS = parseInt(process.env.MAX_WS_SESSIONS || '8', 10);
@@ -129,7 +129,10 @@ function clearSessionCookie(req) {
 }
 
 function sanitizeDownloadName(name) {
-    const base = path.basename(String(name || 'download')).replace(/[^\w.\-()+ ]+/g, '_').trim();
+    let base = path.basename(String(name || 'download'))
+        .replace(/[^\w.\-()+ ]+/g, '_')
+        .replace(/^[_.\s-]+|[_.\s-]+$/g, '')
+        .trim();
     return base.slice(0, 180) || 'download';
 }
 
@@ -137,10 +140,10 @@ function isPrivateOrBlockedHost(hostname) {
     if (!hostname) return true;
     const host = String(hostname).toLowerCase().replace(/^\[|\]$/g, '');
     if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) return true;
-    if (host === 'metadata.google.internal') return true;
+    if (host === 'metadata.google.internal' || host.endsWith('.nip.io') || host.endsWith('.sslip.io')) return true;
 
     const plain = host.replace(/^::ffff:/, '');
-    if (plain === '::1' || plain === '0.0.0.0') return true;
+    if (plain === '::1' || plain === '::' || plain === '0.0.0.0' || plain === '') return true;
     if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(plain)) return true;
     if (/^172\.(1[6-9]|2\d|3[01])\./.test(plain)) return true;
     if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(plain)) return true; // CGNAT
@@ -246,7 +249,7 @@ function saveSessions() {
 loadSessions();
 
 // Housekeeping interval
-setInterval(() => {
+const housekeepingTimer = setInterval(() => {
     const now = Date.now();
     let cleaned = false;
     for (const [tokenHash, v] of validTokens) {
@@ -282,6 +285,7 @@ setInterval(() => {
         });
     });
 }, 5 * 60 * 1000);
+if (housekeepingTimer.unref) housekeepingTimer.unref();
 
 // ---------- Security Logging & Threat Feeds ----------
 const ABUSEIPDB_KEY = process.env.ABUSEIPDB_KEY || null;
@@ -321,8 +325,13 @@ async function refreshBlocklists() {
     console.log(`[blocklist] Refreshed: ${publicBlocklist.size} blocked IPs from ${BLOCKLIST_FEEDS.length} feeds.`);
 }
 
-refreshBlocklists().catch(() => {});
-setInterval(() => refreshBlocklists().catch(() => {}), 60 * 60 * 1000);
+if (require.main === module && !process.env.SKIP_BLOCKLIST_REFRESH && process.env.NODE_ENV !== 'test') {
+    refreshBlocklists().catch(() => {});
+}
+const blocklistTimer = setInterval(() => {
+    if (process.env.NODE_ENV !== 'test') refreshBlocklists().catch(() => {});
+}, 60 * 60 * 1000);
+if (blocklistTimer.unref) blocklistTimer.unref();
 
 function securityLog(event) {
     const entry = JSON.stringify({ ts: new Date().toISOString(), ...event }) + '\n';
@@ -799,9 +808,11 @@ async function attachContextBindings(ctx) {
     } catch (_) {}
 }
 
-startBrowser().catch((err) => {
-    console.error('[!] Initial browser start failed, will retry on connection:', err.message);
-});
+if (require.main === module) {
+    startBrowser().catch((err) => {
+        console.error('[!] Initial browser start failed, will retry on connection:', err.message);
+    });
+}
 
 // ---------- WebSocket Server & Connection Management ----------
 const server = http.createServer(app);
@@ -2047,6 +2058,35 @@ wss.on('connection', async (ws) => {
     });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`[*] MSuite-Browser listening on 0.0.0.0:${PORT}`);
-});
+if (require.main === module) {
+    server.listen(PORT, '0.0.0.0', () => {
+        console.log(`[*] MSuite-Browser listening on 0.0.0.0:${PORT}`);
+    });
+}
+
+module.exports = {
+    app,
+    server,
+    wss,
+    startBrowser,
+    getClientIp,
+    getEffectiveHost,
+    hashToken,
+    escapeHtml,
+    parseCookies,
+    extractRawToken,
+    isTokenValid,
+    touchToken,
+    sessionCookie,
+    clearSessionCookie,
+    sanitizeDownloadName,
+    isPrivateOrBlockedHost,
+    assertSafeNavigationUrl,
+    validateOrigin,
+    buildSearchUrl,
+    validTokens,
+    loginAttempts,
+    globalRateMap,
+    activeSockets,
+    PASSWORD
+};

@@ -1,11 +1,11 @@
 {
   "name": "msuite-browser",
-  "version": "1.2.0",
+  "version": "2.0.0",
   "description": "Debian 13 Virtual Browser - Secure Remote Browser Isolation (RBI) with Node.js, Playwright, and WebSockets",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --check server.js && node --check public/app.js"
+    "test": "node --check server.js && node --check public/app.js && node --test tests/unit.test.js tests/api.test.js"
   },
   "keywords": [
     "msuite",

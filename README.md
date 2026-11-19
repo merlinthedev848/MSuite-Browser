@@ -1,5 +1,7 @@
 # MSuite-Browser: Debian 13 Virtual Browser
 
+[![CI](https://github.com/merlinthedev848/MSuite-Browser/actions/workflows/ci.yml/badge.svg)](https://github.com/merlinthedev848/MSuite-Browser/actions/workflows/ci.yml)
+
 A secure, high-performance Remote Browser Isolation (RBI) tool built with Node.js, Playwright, and WebSockets.
 
 > **Security Note:** Designed for single-tenant use behind HTTPS. Client sessions run inside per-connection isolated `BrowserContext` instances. Never expose an unauthenticated or default-password instance to the public internet.
@@ -161,3 +163,20 @@ browser.example.com {
 - **Health Check Endpoint:** `GET /healthz` (returns `200 OK` when browser engine is operational; `503 Service Unavailable` during startup or engine recovery).
 - **Session Persistence:** Hashed authentication tokens persist in `browser_data/sessions.json`.
 - **Downloads Directory:** Downloaded files are stored with unique, collision-proof identifiers under `browser_data/downloads` and automatically purged after 24 hours.
+
+---
+
+## Automated Testing & CI
+
+Run the unit, security, and integration test suite locally:
+
+```bash
+npm test
+```
+
+The CI pipeline runs automatically on all pushes and pull requests across Node.js versions (20.x, 22.x), executing:
+1. Syntax and static verification (`server.js`, `public/app.js`).
+2. Unit tests (`tests/unit.test.js`): Hashing, cookie security, SSRF and private IP blocking, path traversal prevention, search query routing, CSWSH validation.
+3. Integration tests (`tests/api.test.js`): Authentication handshake, CSRF origin checking, session persistence and logout, rate limiting and lockout, WebSocket upgrades.
+4. Shell script syntax and file mode validation (`install.sh`, `entrypoint.sh`).
+5. Dockerfile build verification.
